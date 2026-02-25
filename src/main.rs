@@ -22,6 +22,7 @@
 //   andromeda config show          — show all config values
 //   andromeda config port <PORT>   — set the dashboard port
 //   andromeda config binary <PATH> — set the binary path
+//   andromeda purge                — delete dashboard binary only (keeps config)
 //   andromeda uninstall            — remove dashboard binary and config
 //   andromeda setup                — interactive first-time setup wizard
 // =============================================================================
@@ -110,11 +111,20 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigCmd,
     },
-    /// Remove the dashboard binary and all config (with confirmation)
+    /// Delete the dashboard binary file only (keeps config and API key)
+    Purge {
+        /// Skip confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Remove dashboard binary, config, logs, and all Andromeda data
     Uninstall {
         /// Skip confirmation prompt
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Also remove the andromeda CLI binary itself
+        #[arg(long)]
+        with_cli: bool,
     },
     /// Interactive first-time setup wizard
     Setup {
@@ -277,15 +287,17 @@ fn green_box(title: &str) {
     println!("\x1b[0m");
 }
 
-fn print_banner() {
-    let version = env!("CARGO_PKG_VERSION");
+/// `dashboard_version` — installed dashboard release tag (e.g. "v1.4.0").
+/// Falls back to the CLI's own Cargo version if the dashboard is not installed.
+fn print_banner(dashboard_version: Option<&str>) {
+    let version = dashboard_version.unwrap_or(env!("CARGO_PKG_VERSION"));
     println!("\x1b[36m █████╗ ███╗   ██╗██████╗ ██████╗  ██████╗ ███╗   ███╗███████╗██████╗  █████╗ \x1b[0m");
     println!("\x1b[36m██╔══██╗████╗  ██║██╔══██╗██╔══██╗██╔═══██╗████╗ ████║██╔════╝██╔══██╗██╔══██╗\x1b[0m");
     println!("\x1b[36m███████║██╔██╗ ██║██║  ██║██████╔╝██║   ██║██╔████╔██║█████╗  ██║  ██║███████║\x1b[0m");
     println!("\x1b[36m██╔══██║██║╚██╗██║██║  ██║██╔══██╗██║   ██║██║╚██╔╝██║██╔══╝  ██║  ██║██╔══██║\x1b[0m");
     println!("\x1b[36m██║  ██║██║ ╚████║██████╔╝██║  ██║╚██████╔╝██║ ╚═╝ ██║███████╗██████╔╝██║  ██║\x1b[0m");
     println!("\x1b[36m╚═╝  ╚═╝╚═╝  ╚═══╝╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝╚═════╝ ╚═╝  ╚═╝\x1b[0m");
-    println!("\x1b[90m Runtime Intelligence Engine — v{}\x1b[0m", version);
+    println!("\x1b[90m Remote Dashboard Manager — {}\x1b[0m", version);
     println!();
 }
 
@@ -464,9 +476,10 @@ async fn detect_actual_port(start_offset: u64, pid: u32) -> Option<u16> {
             if file.seek(tokio::io::SeekFrom::Start(start_offset)).await.is_ok() {
                 let mut buf = String::new();
                 let _ = file.read_to_string(&mut buf).await;
-                // Dashboard prints: "Localhost:  http://localhost:PORT?api_key=..."
+                // Dashboard prints: "  Localhost:  http://localhost:PORT?api_key=..."
+                // (with leading spaces — trim before matching)
                 for line in buf.lines() {
-                    if let Some(rest) = line.strip_prefix("Localhost:") {
+                    if let Some(rest) = line.trim_start().strip_prefix("Localhost:") {
                         if let Some(port_part) = rest.split("http://localhost:").nth(1) {
                             if let Ok(p) = port_part.split('?').next()
                                 .unwrap_or("").trim().parse::<u16>()
@@ -1330,22 +1343,24 @@ fn cmd_config_set_binary(path: &str) {
     }
 }
 
-// ─── Command: uninstall ──────────────────────────────────────────────────────
+// ─── Command: purge ──────────────────────────────────────────────────────────
 
-fn cmd_uninstall(yes: bool) {
+/// Delete the dashboard binary only — leaves config, API key, and logs intact.
+/// Use `andromeda install` afterwards to re-download.
+fn cmd_purge(yes: bool) {
     use std::io::Write;
 
-    cyan_box("ANDROMEDA UNINSTALL");
+    let cfg    = load_config();
+    let binary = cfg.binary();
 
-    let cfg      = load_config();
-    let binary   = cfg.binary();
-    let config_d = config_dir();
-
-    info("This will remove:");
-    if binary.exists() {
-        info(&format!("  Dashboard binary  : {}", binary.display()));
+    if !binary.exists() {
+        warn(&format!("Dashboard binary not found at {}", binary.display()));
+        info("Nothing to delete.");
+        return;
     }
-    info(&format!("  Config directory  : {}", config_d.display()));
+
+    info(&format!("This will delete:  {}", binary.display()));
+    info("Config and API key will be kept.");
     println!();
 
     if !yes {
@@ -1359,37 +1374,134 @@ fn cmd_uninstall(yes: bool) {
         }
     }
 
-    // Stop dashboard if running
-    if let Some(pid) = read_pid() {
-        if process_alive(pid) {
-            info("Stopping dashboard...");
-            kill_pid(pid);
-            std::thread::sleep(Duration::from_millis(500));
+    // Stop dashboard if running before deleting its binary
+    let n = kill_all_andromeda();
+    if n > 0 {
+        info("Stopped running dashboard...");
+        std::thread::sleep(Duration::from_millis(800));
+    }
+
+    match std::fs::remove_file(&binary) {
+        Ok(_) => {
+            // Clear the installed version from config so install is required again
+            let mut cfg2 = load_config();
+            cfg2.installed_version = None;
+            let _ = save_config(&cfg2);
+            ok(&format!("Deleted: {}", binary.display()));
+            info("Run 'andromeda install' to re-download the dashboard.");
+        }
+        Err(e) => err(&format!("Could not delete binary: {}", e)),
+    }
+}
+
+// ─── Command: uninstall ──────────────────────────────────────────────────────
+
+fn cmd_uninstall(yes: bool, with_cli: bool) {
+    use std::io::Write;
+
+    cyan_box("ANDROMEDA UNINSTALL");
+
+    let cfg      = load_config();
+    let dashboard = cfg.binary();
+    let config_d  = config_dir();
+    let cli_exe   = std::env::current_exe().ok();
+
+    // ── Show what will be removed ─────────────────────────────────────────────
+    info("This will remove:");
+    if dashboard.exists() {
+        info(&format!("  Dashboard binary  : {}", dashboard.display()));
+    }
+    if config_d.exists() {
+        info(&format!("  Config + logs     : {}", config_d.display()));
+    }
+    if with_cli {
+        if let Some(ref p) = cli_exe {
+            info(&format!("  CLI binary        : {}", p.display()));
+        }
+    }
+    println!();
+
+    if !yes {
+        print!("  Continue? [y/N]: ");
+        std::io::stdout().flush().ok();
+        let mut ans = String::new();
+        std::io::stdin().read_line(&mut ans).ok();
+        if ans.trim().to_lowercase() != "y" {
+            info("Cancelled.");
+            return;
         }
     }
 
-    // Remove binary
-    if binary.exists() {
-        match std::fs::remove_file(&binary) {
-            Ok(_)  => ok(&format!("Removed: {}", binary.display())),
-            Err(e) => err(&format!("Could not remove binary: {}", e)),
+    // ── Kill ALL running dashboard processes ──────────────────────────────────
+    let n = kill_all_andromeda();
+    if n > 0 {
+        info(&format!("Stopped {} running dashboard process(es).", n));
+        std::thread::sleep(Duration::from_millis(800));
+    }
+
+    // ── Delete dashboard binary ───────────────────────────────────────────────
+    if dashboard.exists() {
+        match std::fs::remove_file(&dashboard) {
+            Ok(_)  => ok(&format!("Removed: {}", dashboard.display())),
+            Err(e) => err(&format!("Could not remove dashboard binary: {}", e)),
         }
     }
 
-    // Remove config + logs
+    // ── Delete dashboard install directory if now empty ───────────────────────
+    if let Some(dir) = dashboard.parent() {
+        if dir.exists() {
+            // Only remove the dir if it's empty (don't nuke unrelated files)
+            let _ = std::fs::remove_dir(dir); // silently ignore if not empty
+        }
+    }
+
+    // ── Delete config directory (config.toml, .pid, .log, .log.old) ──────────
     if config_d.exists() {
         match std::fs::remove_dir_all(&config_d) {
             Ok(_)  => ok(&format!("Removed: {}", config_d.display())),
-            Err(e) => err(&format!("Could not remove config dir: {}", e)),
+            Err(e) => err(&format!("Could not remove config directory: {}", e)),
+        }
+    }
+
+    // ── Optionally delete CLI binary itself ───────────────────────────────────
+    if with_cli {
+        if let Some(cli_path) = cli_exe {
+            #[cfg(not(target_os = "windows"))]
+            {
+                // On Unix the file can be unlinked while the process still runs.
+                match std::fs::remove_file(&cli_path) {
+                    Ok(_)  => ok(&format!("Removed CLI: {}", cli_path.display())),
+                    Err(e) => err(&format!("Could not remove CLI binary: {}", e)),
+                }
+            }
+            #[cfg(target_os = "windows")]
+            {
+                // On Windows a running binary cannot be deleted directly.
+                // Spawn a detached cmd that waits 2 s then deletes the file.
+                let path_str = cli_path.to_string_lossy().into_owned();
+                let script = format!(
+                    "ping 127.0.0.1 -n 3 >nul & del /F /Q \"{}\"",
+                    path_str
+                );
+                use std::os::windows::process::CommandExt;
+                const DETACHED_PROCESS: u32 = 0x00000008;
+                std::process::Command::new("cmd")
+                    .args(["/C", &script])
+                    .creation_flags(DETACHED_PROCESS)
+                    .spawn().ok();
+                ok(&format!("CLI will be deleted in ~2 s: {}", cli_path.display()));
+            }
         }
     }
 
     println!();
     green_box("UNINSTALL COMPLETE");
     println!();
-    info("The andromeda CLI binary itself is still installed.");
-    info("To remove it, delete andromeda[.exe] from your PATH directory.");
-    println!();
+    if !with_cli {
+        info("CLI binary kept. To also remove it, run:");
+        info("  andromeda uninstall --with-cli");
+        println!();
+    }
 }
 
 // ─── Command: tunnel cloudflare ──────────────────────────────────────────────
@@ -1869,8 +1981,20 @@ async fn cmd_setup(repo: &str) -> Result<()> {
 #[tokio::main]
 async fn main() {
     init_terminal();
-    print_banner();
     let cli = Cli::parse();
+
+    // Show the ASCII banner only for version checks and first-time install.
+    // Every other command is silent at the start so output stays clean.
+    let show_banner = matches!(
+        &cli.command,
+        Commands::Version { .. } | Commands::Install { .. }
+    );
+    if show_banner {
+        // Use the installed dashboard release tag (e.g. "v1.4.0") as the version
+        // shown in the banner.  Falls back to CLI's own Cargo version if not installed.
+        let cfg = load_config();
+        print_banner(cfg.installed_version.as_deref());
+    }
 
     let result: Result<()> = match cli.command {
         Commands::Version { repo }         => { cmd_version(&repo).await; Ok(()) }
@@ -1903,7 +2027,8 @@ async fn main() {
             ConfigCmd::Port { port }    => { cmd_config_set_port(port); Ok(()) }
             ConfigCmd::Binary { path }  => { cmd_config_set_binary(&path); Ok(()) }
         },
-        Commands::Uninstall { yes }        => { cmd_uninstall(yes); Ok(()) }
+        Commands::Purge     { yes }        => { cmd_purge(yes); Ok(()) }
+        Commands::Uninstall { yes, with_cli } => { cmd_uninstall(yes, with_cli); Ok(()) }
         Commands::Setup { repo }           => cmd_setup(&repo).await,
     };
 
