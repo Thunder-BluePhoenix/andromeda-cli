@@ -52,15 +52,19 @@ jobs:
             binary:     andromeda
             use_cross:  true
 
-          # ── macOS x86_64 ────────────────────────────────────────────────────
-          - os:         macos-latest
+          # ── macOS x86_64 (Intel) ────────────────────────────────────────────
+          # macos-14 is Apple Silicon (M1) but Rust can cross-compile to
+          # x86_64-apple-darwin without any extra tooling.
+          - os:         macos-14
             target:     x86_64-apple-darwin
             asset_name: andromeda-macos-x86_64
             binary:     andromeda
             use_cross:  false
 
-          # ── macOS Apple Silicon ─────────────────────────────────────────────
-          - os:         macos-latest
+          # ── macOS Apple Silicon (aarch64) ───────────────────────────────────
+          # macos-15 is also Apple Silicon — using a different label than the
+          # x86_64 job so they never share a cached `target` directory.
+          - os:         macos-15
             target:     aarch64-apple-darwin
             asset_name: andromeda-macos-aarch64
             binary:     andromeda
@@ -82,9 +86,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-
+            ${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-cargo-
 
       - name: Install cross (for aarch64 Linux)
         if: matrix.use_cross
