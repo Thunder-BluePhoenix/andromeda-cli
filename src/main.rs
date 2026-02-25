@@ -157,6 +157,8 @@ struct Config {
     binary_path:       Option<String>,
     dashboard_repo:    Option<String>,
     installed_version: Option<String>,
+    /// Whether to launch the dashboard with ANDROMEDA_SUDO=1 (admin/elevated mode).
+    sudo:              Option<bool>,
 }
 
 impl Config {
@@ -168,6 +170,9 @@ impl Config {
     }
     fn binary(&self) -> PathBuf {
         self.binary_path.as_deref().map(PathBuf::from).unwrap_or_else(default_binary_path)
+    }
+    fn sudo_mode(&self) -> bool {
+        self.sudo.unwrap_or(false)
     }
 }
 
@@ -467,7 +472,7 @@ fn do_spawn(cmd: &mut std::process::Command) -> Result<std::process::Child> {
     cmd.spawn().context("spawn dashboard")
 }
 
-fn spawn_bg(binary: &PathBuf, api_key: &str, port: u16) -> Result<u32> {
+fn spawn_bg(binary: &PathBuf, api_key: &str, port: u16, sudo: bool) -> Result<u32> {
     std::fs::create_dir_all(config_dir())?;
 
     // Rotate log if > 10 MB to avoid unbounded growth
@@ -487,6 +492,7 @@ fn spawn_bg(binary: &PathBuf, api_key: &str, port: u16) -> Result<u32> {
     let mut cmd = std::process::Command::new(binary);
     cmd.env("ANDROMEDA_API_KEY", api_key)
        .env("ANDROMEDA_PORT", port.to_string())
+       .env("ANDROMEDA_SUDO", if sudo { "1" } else { "0" })
        .stdin(Stdio::null())
        .stdout(Stdio::from(log_file))
        .stderr(Stdio::from(err_file));
@@ -864,7 +870,7 @@ async fn cmd_start(detach: bool) -> Result<()> {
     // Always spawn via background helper (stdout/stderr → log file, PID saved).
     // This ensures `andromeda stop` / `andromeda restart` from another terminal
     // always work regardless of whether we attach to the log or not.
-    let pid = spawn_bg(&binary, &key, port)?;
+    let pid = spawn_bg(&binary, &key, port, cfg.sudo_mode())?;
     write_pid(pid)?;
     ok(&format!("Dashboard starting (PID {})...", pid));
 
@@ -1475,6 +1481,171 @@ fn cmd_ipv6() {
 
 // ─── Command: setup ──────────────────────────────────────────────────────────
 
+fn setup_permissions(cfg: &mut Config) -> Result<()> {
+    use std::io::Write;
+
+    // ── macOS: TCC permissions ────────────────────────────────────────────────
+    #[cfg(target_os = "macos")]
+    {
+        info("The dashboard uses these macOS permissions:");
+        println!("    Screen Recording  — remote screen view");
+        println!("    Accessibility     — remote mouse & keyboard control");
+        println!("    Camera            — webcam streaming");
+        println!("    Microphone        — audio streaming");
+        println!();
+        info("macOS will ask you to grant each permission the first time the");
+        info("feature is used. You can also grant them now via System Settings.");
+        println!();
+        print!("  Open System Settings › Privacy & Security now? [y/N]: ");
+        std::io::stdout().flush()?;
+        let mut ans = String::new();
+        std::io::stdin().read_line(&mut ans)?;
+        if ans.trim().to_lowercase() == "y" {
+            // Open each relevant pane in System Settings
+            for pane in &[
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera",
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
+            ] {
+                let _ = std::process::Command::new("open").arg(pane).status();
+                // Brief pause so each pane has time to open
+                std::thread::sleep(std::time::Duration::from_millis(600));
+            }
+            ok("System Settings opened — grant access to 'andromeda-dashboard' in each pane.");
+            info("Press Enter when done...");
+            let mut _buf = String::new();
+            std::io::stdin().read_line(&mut _buf)?;
+        } else {
+            info("You can grant permissions later in:");
+            info("  System Settings › Privacy & Security › Screen Recording / Accessibility / Camera / Microphone");
+        }
+        println!();
+    }
+
+    // ── Linux: group membership ───────────────────────────────────────────────
+    #[cfg(target_os = "linux")]
+    {
+        let user = std::env::var("USER").unwrap_or_else(|_| "your-user".into());
+        let mut needs_logout = false;
+
+        // Check video group (for camera / webcam)
+        let in_video = std::process::Command::new("id")
+            .arg("-Gn").output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("video"))
+            .unwrap_or(false);
+
+        if in_video {
+            ok("User is in 'video' group  (camera OK)");
+        } else {
+            warn("User is not in 'video' group  (camera may not work)");
+            info(&format!("  Fix:  sudo usermod -aG video {}", user));
+            needs_logout = true;
+        }
+
+        // Check audio group (for microphone / audio)
+        let in_audio = std::process::Command::new("id")
+            .arg("-Gn").output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("audio"))
+            .unwrap_or(false);
+
+        if in_audio {
+            ok("User is in 'audio' group  (microphone OK)");
+        } else {
+            warn("User is not in 'audio' group  (microphone may not work)");
+            info(&format!("  Fix:  sudo usermod -aG audio {}", user));
+            needs_logout = true;
+        }
+
+        if needs_logout {
+            println!();
+            print!("  Apply group changes now (requires sudo)? [y/N]: ");
+            std::io::stdout().flush()?;
+            let mut ans = String::new();
+            std::io::stdin().read_line(&mut ans)?;
+            if ans.trim().to_lowercase() == "y" {
+                if !in_video {
+                    let status = std::process::Command::new("sudo")
+                        .args(["usermod", "-aG", "video", &user]).status();
+                    match status {
+                        Ok(s) if s.success() => ok("Added to 'video' group"),
+                        _ => warn("Could not add to 'video' — run manually with sudo"),
+                    }
+                }
+                if !in_audio {
+                    let status = std::process::Command::new("sudo")
+                        .args(["usermod", "-aG", "audio", &user]).status();
+                    match status {
+                        Ok(s) if s.success() => ok("Added to 'audio' group"),
+                        _ => warn("Could not add to 'audio' — run manually with sudo"),
+                    }
+                }
+                warn("Log out and back in (or run 'newgrp video && newgrp audio') for group changes to take effect.");
+            }
+        }
+        println!();
+    }
+
+    // ── Windows: administrator check ──────────────────────────────────────────
+    #[cfg(target_os = "windows")]
+    {
+        let is_admin = std::process::Command::new("net")
+            .args(["session"]).output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if is_admin {
+            ok("Running as Administrator  (all features available)");
+        } else {
+            warn("Not running as Administrator.");
+            info("Some features (firewall rules, system commands) need admin rights.");
+            info("To run with admin rights: right-click the terminal → 'Run as administrator'");
+            info("Then re-run: andromeda setup");
+        }
+        println!();
+    }
+
+    // ── All platforms: admin/sudo mode ────────────────────────────────────────
+    let current = cfg.sudo_mode();
+    println!("  Admin mode lets the dashboard run system-level commands from the");
+    println!("  web UI (file operations outside home, process management, etc.).");
+    println!();
+    if current {
+        ok("Admin mode is currently ENABLED.");
+        print!("  Disable admin mode? [y/N]: ");
+    } else {
+        info("Admin mode is currently disabled.");
+        print!("  Enable admin mode? [y/N]: ");
+    }
+    std::io::stdout().flush()?;
+    let mut ans = String::new();
+    std::io::stdin().read_line(&mut ans)?;
+    if ans.trim().to_lowercase() == "y" {
+        cfg.sudo = Some(!current);
+        if !current {
+            ok("Admin mode ENABLED  (ANDROMEDA_SUDO=1 will be set on start)");
+
+            // macOS: warn that accessibility must be granted for full admin control
+            #[cfg(target_os = "macos")]
+            warn("Remember to grant Accessibility permission in System Settings so remote control works.");
+
+            // Linux: remind about sudo
+            #[cfg(target_os = "linux")]
+            info("The dashboard process inherits your sudo rights — no password prompt in the UI.");
+
+            // Windows: remind about UAC
+            #[cfg(target_os = "windows")]
+            info("For full admin features, run the terminal as Administrator before `andromeda start`.");
+        } else {
+            ok("Admin mode DISABLED.");
+        }
+    } else {
+        info("Admin mode unchanged.");
+    }
+
+    Ok(())
+}
+
 async fn cmd_setup(repo: &str) -> Result<()> {
     use std::io::Write;
 
@@ -1548,8 +1719,13 @@ async fn cmd_setup(repo: &str) -> Result<()> {
         _ => {}
     }
 
-    // ── Step 4: Start now? ───────────────────────────────────────────────────
-    hdr("STEP 4 — START");
+    // ── Step 4: Permissions ──────────────────────────────────────────────────
+    hdr("STEP 4 — PERMISSIONS");
+    setup_permissions(&mut cfg)?;
+    save_config(&cfg)?;
+
+    // ── Step 5: Start now? ───────────────────────────────────────────────────
+    hdr("STEP 5 — START");
     print!("  Start the dashboard now? [Y/n]: ");
     std::io::stdout().flush()?;
     let mut ans = String::new();
