@@ -2,7 +2,7 @@
 
 A dedicated command-line manager for [Andromeda Dashboard](https://github.com/Thunder-BluePhoenix/andromeda-releases).
 
-Install the CLI once — then use it to download, start, stop, tunnel, and manage your Andromeda dashboard from any terminal.
+Install the CLI once — then use it to download, start, stop, tunnel, monitor, and manage your Andromeda dashboard from any terminal.
 
 ---
 
@@ -35,7 +35,10 @@ andromeda setup
 # 2. Start the dashboard
 andromeda start
 
-# 3. Open a free internet tunnel (no account, no data limits)
+# 3. Open in browser
+andromeda open
+
+# 4. Open a free internet tunnel (no account, no data limits)
 andromeda tunnel cloudflare
 ```
 
@@ -43,22 +46,65 @@ andromeda tunnel cloudflare
 
 ## All Commands
 
+### Install & Update
+
 | Command | Description |
 |---|---|
 | `andromeda install` | Download the Andromeda dashboard binary from GitHub releases |
-| `andromeda update` | Update the dashboard to the latest release |
+| `andromeda update` | Update to latest release — skips if already up to date, auto-restarts if running |
 | `andromeda setup` | Interactive first-time setup wizard |
+
+### Process Management
+
+| Command | Description |
+|---|---|
 | `andromeda start` | Start the dashboard in the background |
-| `andromeda start --foreground` | Start the dashboard and stream logs |
+| `andromeda start --foreground` | Start and stream logs to the terminal |
 | `andromeda stop` | Stop the running dashboard |
 | `andromeda restart` | Restart the dashboard |
-| `andromeda status` | Show running status and all access URLs |
+| `andromeda status` | Show running status, PID, version, and all access URLs |
+
+### Dashboard Access
+
+| Command | Description |
+|---|---|
+| `andromeda open` | Open the dashboard in the default web browser |
+| `andromeda logs` | Show the last 50 lines of dashboard logs |
+| `andromeda logs -f` | Follow dashboard logs in real time (like `tail -f`) |
+| `andromeda logs -n 100` | Show the last 100 lines |
+
+### API Key
+
+| Command | Description |
+|---|---|
 | `andromeda apikey` | Show the current API key and access URL |
 | `andromeda apikey new` | Generate and apply a new random API key |
 | `andromeda apikey set <KEY>` | Set a specific API key |
+
+### Internet Tunnels
+
+| Command | Description |
+|---|---|
 | `andromeda tunnel cloudflare` | Open a free Cloudflare Tunnel (no account needed) |
 | `andromeda tunnel ngrok` | Open an ngrok tunnel (requires free account) |
-| `andromeda ipv6` | Show IPv6 internet access URL |
+| `andromeda ipv6` | Show IPv6 internet access URL (zero-config if available) |
+
+### Configuration
+
+| Command | Description |
+|---|---|
+| `andromeda config show` | Show all config values (key, port, binary path, version, log path) |
+| `andromeda config port <N>` | Change the dashboard port (default: 3000) |
+| `andromeda config binary <PATH>` | Set a custom path to the dashboard binary |
+
+### Diagnostics & Maintenance
+
+| Command | Description |
+|---|---|
+| `andromeda version` | Show CLI version, installed dashboard version, and check for updates |
+| `andromeda doctor` | Health check: binary, config, port, internet, IPv6, cloudflared, ngrok |
+| `andromeda uninstall` | Remove dashboard binary and all config (with confirmation) |
+| `andromeda uninstall -y` | Same, but skip the confirmation prompt |
 
 ---
 
@@ -75,6 +121,7 @@ andromeda tunnel cloudflare
 │  andromeda start    ──► launches binary            andromeda-dashboard-macos-x86_64
 │  andromeda stop     ──► kills process              ...
 │  andromeda tunnel   ──► cloudflared / ngrok
+│  andromeda logs     ──► tails dashboard.log
 └─────────────────────────────────────────────┘
          ▲
          │ built by GitHub Actions in
@@ -84,11 +131,20 @@ andromeda tunnel cloudflare
 
 ### Config & data locations
 
-| Platform | Config file | PID file | Dashboard binary |
-|---|---|---|---|
-| Windows | `%APPDATA%\andromeda\config.toml` | `%APPDATA%\andromeda\dashboard.pid` | `%LOCALAPPDATA%\Andromeda\andromeda-dashboard.exe` |
-| Linux | `~/.config/andromeda/config.toml` | `~/.config/andromeda/dashboard.pid` | `~/.local/share/Andromeda/andromeda-dashboard` |
-| macOS | `~/Library/Application Support/andromeda/config.toml` | same dir | `~/Library/Application Support/Andromeda/andromeda-dashboard` |
+| Platform | Config dir | Dashboard binary |
+|---|---|---|
+| Windows | `%APPDATA%\andromeda\` | `%LOCALAPPDATA%\Andromeda\andromeda-dashboard.exe` |
+| Linux | `~/.config/andromeda/` | `~/.local/share/Andromeda/andromeda-dashboard` |
+| macOS | `~/Library/Application Support/andromeda/` | `~/Library/Application Support/Andromeda/andromeda-dashboard` |
+
+**Files inside the config dir:**
+
+| File | Purpose |
+|---|---|
+| `config.toml` | API key, port, binary path, installed version |
+| `dashboard.pid` | PID of the running dashboard process |
+| `dashboard.log` | Dashboard stdout/stderr (rotated at 10 MB) |
+| `dashboard.log.old` | Previous log before rotation |
 
 ---
 
@@ -117,6 +173,28 @@ Forward TCP port `3000` to your machine's LAN IP in your router's admin panel. `
 
 ---
 
+## Doctor Output Example
+
+```
+  ╔══════════════════════════════════════════════════════════╗
+  ║  ANDROMEDA DOCTOR — HEALTH CHECK                         ║
+  ╚══════════════════════════════════════════════════════════╝
+
+  [+] Binary           : C:\Users\you\AppData\Local\Andromeda\andromeda-dashboard.exe
+  [+] Config file      : C:\Users\you\AppData\Roaming\andromeda\config.toml
+  [+] API key          : configured
+  [+] Installed ver    : v0.1.0
+  [+] Dashboard        : running (PID 12345)
+  [+] Port 3000        : open
+  [+] Log file         : ...dashboard.log (42 KB)
+  [+] Internet         : reachable (public IP: 1.2.3.4)
+  [!] IPv6             : no global address detected
+  [+] cloudflared      : C:\Program Files\cloudflared\cloudflared.exe
+      ngrok            : not installed (optional)
+```
+
+---
+
 ## Pre-built Binaries
 
 Pre-built CLI binaries are available on the [Releases](https://github.com/Thunder-BluePhoenix/andromeda-cli/releases) page for:
@@ -137,7 +215,7 @@ Pre-built CLI binaries are available on the [Releases](https://github.com/Thunde
 git clone https://github.com/Thunder-BluePhoenix/andromeda-cli
 cd andromeda-cli
 cargo build --release
-# binary at: target/release/andromeda
+# binary at: target/release/andromeda[.exe]
 ```
 
 Requires [Rust](https://rustup.rs/) 1.70 or later.

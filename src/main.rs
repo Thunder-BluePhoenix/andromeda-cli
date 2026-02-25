@@ -2,18 +2,26 @@
 // Andromeda CLI
 //
 // Commands:
+//   andromeda version              — CLI version + dashboard version + update check
 //   andromeda install              — download dashboard binary from GitHub
-//   andromeda update               — update to latest release
+//   andromeda update               — smart update (skips if already latest)
 //   andromeda start [--foreground] — start dashboard (background by default)
 //   andromeda stop                 — stop dashboard
 //   andromeda restart              — restart dashboard
 //   andromeda status               — show status + URLs
+//   andromeda open                 — open dashboard in default browser
+//   andromeda logs [-f] [-n N]     — view / follow dashboard logs
+//   andromeda doctor               — health check: binary, config, ports, tools
 //   andromeda apikey               — show current API key
 //   andromeda apikey set <KEY>     — set a specific API key
 //   andromeda apikey new           — generate and set a new random key
 //   andromeda tunnel cloudflare    — open a free Cloudflare tunnel
 //   andromeda tunnel ngrok         — open an ngrok tunnel
 //   andromeda ipv6                 — show IPv6 internet access info
+//   andromeda config show          — show all config values
+//   andromeda config port <PORT>   — set the dashboard port
+//   andromeda config binary <PATH> — set the binary path
+//   andromeda uninstall            — remove dashboard binary and config
 //   andromeda setup                — interactive first-time setup wizard
 // =============================================================================
 
@@ -41,13 +49,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Show CLI version, installed dashboard version, and latest available
+    Version {
+        #[arg(long, default_value = "Thunder-BluePhoenix/andromeda-releases")]
+        repo: String,
+    },
     /// Download the Andromeda dashboard binary from GitHub releases
     Install {
         /// GitHub repository (owner/repo)
         #[arg(long, default_value = "Thunder-BluePhoenix/andromeda-releases")]
         repo: String,
     },
-    /// Update the dashboard to the latest GitHub release
+    /// Update the dashboard to the latest GitHub release (skips if already latest)
     Update {
         #[arg(long, default_value = "Thunder-BluePhoenix/andromeda-releases")]
         repo: String,
@@ -64,6 +77,19 @@ enum Commands {
     Restart,
     /// Show dashboard status and access URLs
     Status,
+    /// Open the dashboard in the default web browser
+    Open,
+    /// View or follow dashboard logs
+    Logs {
+        /// Follow log output (like tail -f)
+        #[arg(long, short = 'f')]
+        follow: bool,
+        /// Number of lines to show
+        #[arg(long, short = 'n', default_value = "50")]
+        lines: usize,
+    },
+    /// Check system health: binary, config, process, ports, and tools
+    Doctor,
     /// API key management (default: show current key)
     Apikey {
         #[command(subcommand)]
@@ -76,6 +102,17 @@ enum Commands {
     },
     /// Show IPv6 internet access info
     Ipv6,
+    /// Show or modify CLI configuration
+    Config {
+        #[command(subcommand)]
+        action: ConfigCmd,
+    },
+    /// Remove the dashboard binary and all config (with confirmation)
+    Uninstall {
+        /// Skip confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Interactive first-time setup wizard
     Setup {
         #[arg(long, default_value = "Thunder-BluePhoenix/andromeda-releases")]
@@ -101,14 +138,25 @@ enum TunnelKind {
     Ngrok,
 }
 
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Show all current config values
+    Show,
+    /// Set the dashboard port
+    Port { port: u16 },
+    /// Set the path to the dashboard binary
+    Binary { path: String },
+}
+
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 struct Config {
-    api_key:        Option<String>,
-    port:           Option<u16>,
-    binary_path:    Option<String>,
-    dashboard_repo: Option<String>,
+    api_key:           Option<String>,
+    port:              Option<u16>,
+    binary_path:       Option<String>,
+    dashboard_repo:    Option<String>,
+    installed_version: Option<String>,
 }
 
 impl Config {
@@ -131,6 +179,7 @@ fn config_dir() -> PathBuf {
 
 fn config_path() -> PathBuf { config_dir().join("config.toml") }
 fn pid_path()    -> PathBuf { config_dir().join("dashboard.pid") }
+fn log_path()    -> PathBuf { config_dir().join("dashboard.log") }
 
 fn default_binary_path() -> PathBuf {
     let base = dirs::data_local_dir()
@@ -279,11 +328,10 @@ fn kill_pid(pid: u32) -> bool {
     }
 }
 
-// Platform-specific background spawn
 #[cfg(target_os = "windows")]
 fn do_spawn(cmd: &mut std::process::Command) -> Result<std::process::Child> {
     use std::os::windows::process::CommandExt;
-    const DETACHED_PROCESS:       u32 = 0x00000008;
+    const DETACHED_PROCESS:         u32 = 0x00000008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
     cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
         .spawn().context("spawn dashboard")
@@ -295,11 +343,27 @@ fn do_spawn(cmd: &mut std::process::Command) -> Result<std::process::Child> {
 }
 
 fn spawn_bg(binary: &PathBuf, api_key: &str) -> Result<u32> {
+    std::fs::create_dir_all(config_dir())?;
+
+    // Rotate log if > 10 MB to avoid unbounded growth
+    let lp = log_path();
+    if let Ok(meta) = std::fs::metadata(&lp) {
+        if meta.len() > 10 * 1_048_576 {
+            let old = config_dir().join("dashboard.log.old");
+            let _ = std::fs::rename(&lp, old);
+        }
+    }
+
+    let log_file = std::fs::OpenOptions::new()
+        .create(true).append(true).open(&lp)
+        .context("open dashboard log file")?;
+    let err_file = log_file.try_clone()?;
+
     let mut cmd = std::process::Command::new(binary);
     cmd.env("ANDROMEDA_API_KEY", api_key)
        .stdin(Stdio::null())
-       .stdout(Stdio::null())
-       .stderr(Stdio::null());
+       .stdout(Stdio::from(log_file))
+       .stderr(Stdio::from(err_file));
     Ok(do_spawn(&mut cmd)?.id())
 }
 
@@ -347,6 +411,17 @@ async fn github_latest_asset(repo: &str, asset_name: &str) -> Result<(String, St
             a.iter().filter_map(|x| x["name"].as_str()).collect::<Vec<_>>().join(", ")
         }).unwrap_or_default()
     )
+}
+
+async fn github_latest_tag(repo: &str) -> Result<String> {
+    let api_url = format!("https://api.github.com/repos/{}/releases/latest", repo);
+    let resp: serde_json::Value = reqwest::Client::builder()
+        .user_agent("andromeda-cli")
+        .timeout(Duration::from_secs(10))
+        .build()?
+        .get(&api_url).send().await.context("GitHub API request")?
+        .json().await.context("parse response")?;
+    Ok(resp["tag_name"].as_str().unwrap_or("?").to_string())
 }
 
 async fn download_to(url: &str, dest: &PathBuf) -> Result<()> {
@@ -444,7 +519,61 @@ fn cf_extract_url(line: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-// ─── Command: install / update ───────────────────────────────────────────────
+// ─── Command: version ────────────────────────────────────────────────────────
+
+async fn cmd_version(repo: &str) {
+    use std::io::Write;
+
+    cyan_box("ANDROMEDA VERSION");
+
+    let cli_ver = env!("CARGO_PKG_VERSION");
+    info(&format!("CLI version      :  v{}", cli_ver));
+
+    let cfg = load_config();
+
+    // Installed dashboard version — from config or by running the binary
+    let installed = cfg.installed_version.clone().or_else(|| {
+        let binary = cfg.binary();
+        if !binary.exists() { return None; }
+        std::process::Command::new(&binary)
+            .arg("--version")
+            .stdout(Stdio::piped()).stderr(Stdio::null())
+            .output().ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+    });
+
+    match &installed {
+        Some(v) => info(&format!("Dashboard        :  {} (installed)", v)),
+        None    => warn("Dashboard        :  not installed — run 'andromeda install'"),
+    }
+
+    // Latest release on GitHub
+    print!("  Latest release   :  checking...");
+    std::io::stdout().flush().ok();
+
+    match github_latest_tag(repo).await {
+        Ok(latest) => {
+            print!("\r");
+            info(&format!("Latest release   :  {}", latest));
+            if let Some(inst) = &installed {
+                if inst == &latest {
+                    ok("Dashboard is up to date.");
+                } else {
+                    warn(&format!("Update available: {} → {}", inst, latest));
+                    info("Run 'andromeda update' to upgrade.");
+                }
+            }
+        }
+        Err(_) => {
+            print!("\r");
+            warn("Latest release   :  could not reach GitHub");
+        }
+    }
+    println!();
+}
+
+// ─── Command: install ────────────────────────────────────────────────────────
 
 async fn cmd_install(repo: &str) -> Result<()> {
     cyan_box("ANDROMEDA — INSTALL DASHBOARD");
@@ -470,8 +599,9 @@ async fn cmd_install(repo: &str) -> Result<()> {
     }
 
     let mut cfg = load_config();
-    cfg.binary_path    = Some(dest.to_string_lossy().into());
-    cfg.dashboard_repo = Some(repo.into());
+    cfg.binary_path        = Some(dest.to_string_lossy().into());
+    cfg.dashboard_repo     = Some(repo.into());
+    cfg.installed_version  = Some(tag.clone());
     if cfg.api_key.is_none() {
         let k = gen_key();
         ok(&format!("API key    : {}  (saved to config)", k));
@@ -483,6 +613,57 @@ async fn cmd_install(repo: &str) -> Result<()> {
     println!();
     info("Next:  andromeda setup   — interactive wizard");
     info("  or:  andromeda start   — start immediately");
+    Ok(())
+}
+
+// ─── Command: update ─────────────────────────────────────────────────────────
+
+async fn cmd_update(repo: &str) -> Result<()> {
+    cyan_box("ANDROMEDA — UPDATE DASHBOARD");
+
+    let cfg   = load_config();
+    let asset = dashboard_asset_name();
+
+    let (latest_tag, url) = github_latest_asset(repo, &asset).await?;
+    let installed = cfg.installed_version.as_deref().unwrap_or("unknown");
+
+    info(&format!("Installed  : {}", installed));
+    info(&format!("Latest     : {}", latest_tag));
+
+    if installed == latest_tag {
+        ok("Already on the latest version — nothing to do.");
+        return Ok(());
+    }
+
+    // Stop if running, download, optionally restart
+    let was_running = read_pid().map(process_alive).unwrap_or(false);
+    if was_running {
+        info("Stopping dashboard for update...");
+        cmd_stop();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+    }
+
+    let dest = cfg.binary();
+    hdr("DOWNLOADING");
+    info(&format!("→ {}", dest.display()));
+    download_to(&url, &dest).await?;
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    let mut cfg = load_config();
+    cfg.installed_version = Some(latest_tag.clone());
+    save_config(&cfg)?;
+
+    ok(&format!("Updated to {}", latest_tag));
+
+    if was_running {
+        info("Restarting dashboard...");
+        Box::pin(cmd_start(false)).await?;
+    }
     Ok(())
 }
 
@@ -554,7 +735,9 @@ async fn cmd_start(foreground: bool) -> Result<()> {
     }
     println!();
     dim("andromeda stop              — stop the dashboard");
+    dim("andromeda open              — open in browser");
     dim("andromeda tunnel cloudflare — open a free internet tunnel");
+    dim(&format!("andromeda logs -f           — follow dashboard logs"));
     Ok(())
 }
 
@@ -593,8 +776,167 @@ async fn cmd_status() {
         None      => warn("Stopped"),
     }
     println!();
-    dim(&format!("Binary  :  {}", cfg.binary().display()));
-    dim(&format!("Config  :  {}", config_path().display()));
+    dim(&format!("Binary   :  {}", cfg.binary().display()));
+    dim(&format!("Config   :  {}", config_path().display()));
+    dim(&format!("Log      :  {}", log_path().display()));
+    if let Some(v) = &cfg.installed_version {
+        dim(&format!("Version  :  {}", v));
+    }
+}
+
+// ─── Command: open ───────────────────────────────────────────────────────────
+
+fn cmd_open() {
+    let cfg  = load_config();
+    let port = cfg.port();
+    let key  = cfg.api_key();
+
+    let running = read_pid().map(process_alive).unwrap_or(false) || port_open(port);
+    if !running {
+        warn("Dashboard is not running.");
+        info("Start it first:  andromeda start");
+        return;
+    }
+
+    let url = format!("http://localhost:{}?api_key={}", port, key);
+    info(&format!("Opening: {}", url));
+
+    #[cfg(target_os = "windows")]
+    let r = std::process::Command::new("cmd").args(["/C", "start", "", &url]).spawn();
+
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("open").arg(&url).spawn();
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let r = std::process::Command::new("xdg-open").arg(&url).spawn();
+
+    match r {
+        Ok(_)  => ok("Opened in default browser."),
+        Err(e) => { err(&format!("Could not open browser: {}", e)); info(&format!("Open manually: {}", url)); }
+    }
+}
+
+// ─── Command: logs ───────────────────────────────────────────────────────────
+
+fn cmd_logs(follow: bool, lines: usize) {
+    use std::io::Read;
+
+    let lp = log_path();
+    if !lp.exists() {
+        warn("No log file found.");
+        info(&format!("Expected at: {}", lp.display()));
+        info("The log is created when you start the dashboard: andromeda start");
+        return;
+    }
+
+    // Print last N lines
+    let content = match std::fs::read_to_string(&lp) {
+        Ok(c)  => c,
+        Err(e) => { err(&format!("Read error: {}", e)); return; }
+    };
+    let all: Vec<&str> = content.lines().collect();
+    let start = all.len().saturating_sub(lines);
+    for line in &all[start..] { println!("{}", line); }
+
+    if !follow { return; }
+
+    // Follow mode: poll for appended bytes
+    let mut file = match std::fs::File::open(&lp) {
+        Ok(f)  => f,
+        Err(e) => { err(&format!("Cannot open log: {}", e)); return; }
+    };
+    // Seek to current end
+    let _ = std::io::Seek::seek(&mut file, std::io::SeekFrom::End(0));
+    dim("Following log — Ctrl+C to stop...");
+    loop {
+        let mut buf = String::new();
+        let _ = file.read_to_string(&mut buf);
+        if !buf.is_empty() { print!("{}", buf); }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+// ─── Command: doctor ─────────────────────────────────────────────────────────
+
+async fn cmd_doctor() {
+    cyan_box("ANDROMEDA DOCTOR — HEALTH CHECK");
+
+    let cfg  = load_config();
+    let port = cfg.port();
+
+    // Binary
+    let binary = cfg.binary();
+    if binary.exists() {
+        ok(&format!("Binary           : {}", binary.display()));
+    } else {
+        err(&format!("Binary           : NOT FOUND — run 'andromeda install'"));
+        info(&format!("  Expected       : {}", binary.display()));
+    }
+
+    // Config file
+    if config_path().exists() {
+        ok(&format!("Config file      : {}", config_path().display()));
+    } else {
+        warn("Config file      : not found (will be created on first install)");
+    }
+
+    // API key
+    if cfg.api_key.is_some() {
+        ok("API key          : configured");
+    } else {
+        warn("API key          : not set — run 'andromeda apikey new'");
+    }
+
+    // Installed version
+    match &cfg.installed_version {
+        Some(v) => ok(&format!("Installed ver    : {}", v)),
+        None    => info("Installed ver    : unknown"),
+    }
+
+    // Process + port
+    match read_pid() {
+        Some(pid) if process_alive(pid) => ok(&format!("Dashboard        : running (PID {})", pid)),
+        Some(pid) => { warn(&format!("Dashboard        : stopped (stale PID {})", pid)); clear_pid(); }
+        None      => warn("Dashboard        : not running"),
+    }
+    if port_open(port) {
+        ok(&format!("Port {}          : open", port));
+    } else {
+        warn(&format!("Port {}          : not open", port));
+    }
+
+    // Log file
+    let lp = log_path();
+    if lp.exists() {
+        let size = std::fs::metadata(&lp).map(|m| m.len()).unwrap_or(0);
+        ok(&format!("Log file         : {} ({} KB)", lp.display(), size / 1024));
+    } else {
+        info("Log file         : not yet created");
+    }
+
+    // Internet
+    match public_ip().await {
+        Some(ip) => ok(&format!("Internet         : reachable (public IP: {})", ip)),
+        None     => warn("Internet         : could not reach api.ipify.org"),
+    }
+
+    // IPv6
+    match ipv6_addr() {
+        Some(v6) => ok(&format!("IPv6             : {} (global — internet accessible)", v6)),
+        None     => info("IPv6             : no global address detected"),
+    }
+
+    // Optional tools
+    match find_bin("cloudflared") {
+        Some(p) => ok(&format!("cloudflared      : {}", p)),
+        None    => info("cloudflared      : not installed (optional, for free tunnels)"),
+    }
+    match find_bin("ngrok") {
+        Some(p) => ok(&format!("ngrok            : {}", p)),
+        None    => info("ngrok            : not installed (optional)"),
+    }
+
+    println!();
 }
 
 // ─── Command: apikey ─────────────────────────────────────────────────────────
@@ -628,6 +970,106 @@ fn cmd_apikey_new() {
     let key = gen_key();
     ok(&format!("Generated  : {}", key));
     cmd_apikey_set(&key);
+}
+
+// ─── Command: config ─────────────────────────────────────────────────────────
+
+fn cmd_config_show() {
+    hdr("CONFIGURATION");
+    let cfg = load_config();
+    println!();
+    info(&format!("Config file    :  {}", config_path().display()));
+    info(&format!("API key        :  {}", cfg.api_key.as_deref().unwrap_or("(not set)")));
+    info(&format!("Port           :  {}", cfg.port()));
+    info(&format!("Binary path    :  {}", cfg.binary().display()));
+    info(&format!("Installed ver  :  {}", cfg.installed_version.as_deref().unwrap_or("unknown")));
+    info(&format!("Log file       :  {}", log_path().display()));
+    println!();
+}
+
+fn cmd_config_set_port(port: u16) {
+    let mut cfg = load_config();
+    cfg.port = Some(port);
+    match save_config(&cfg) {
+        Ok(_) => {
+            ok(&format!("Port set to {}", port));
+            if read_pid().map(process_alive).unwrap_or(false) {
+                warn("Dashboard running — run 'andromeda restart' to apply.");
+            }
+        }
+        Err(e) => err(&format!("Save failed: {}", e)),
+    }
+}
+
+fn cmd_config_set_binary(path: &str) {
+    let mut cfg = load_config();
+    cfg.binary_path = Some(path.to_string());
+    match save_config(&cfg) {
+        Ok(_) => ok(&format!("Binary path set to: {}", path)),
+        Err(e) => err(&format!("Save failed: {}", e)),
+    }
+}
+
+// ─── Command: uninstall ──────────────────────────────────────────────────────
+
+fn cmd_uninstall(yes: bool) {
+    use std::io::Write;
+
+    cyan_box("ANDROMEDA UNINSTALL");
+
+    let cfg      = load_config();
+    let binary   = cfg.binary();
+    let config_d = config_dir();
+
+    info("This will remove:");
+    if binary.exists() {
+        info(&format!("  Dashboard binary  : {}", binary.display()));
+    }
+    info(&format!("  Config directory  : {}", config_d.display()));
+    println!();
+
+    if !yes {
+        print!("  Continue? [y/N]: ");
+        std::io::stdout().flush().ok();
+        let mut ans = String::new();
+        std::io::stdin().read_line(&mut ans).ok();
+        if ans.trim().to_lowercase() != "y" {
+            info("Cancelled.");
+            return;
+        }
+    }
+
+    // Stop dashboard if running
+    if let Some(pid) = read_pid() {
+        if process_alive(pid) {
+            info("Stopping dashboard...");
+            kill_pid(pid);
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    // Remove binary
+    if binary.exists() {
+        match std::fs::remove_file(&binary) {
+            Ok(_)  => ok(&format!("Removed: {}", binary.display())),
+            Err(e) => err(&format!("Could not remove binary: {}", e)),
+        }
+    }
+
+    // Remove config + logs
+    if config_d.exists() {
+        match std::fs::remove_dir_all(&config_d) {
+            Ok(_)  => ok(&format!("Removed: {}", config_d.display())),
+            Err(e) => err(&format!("Could not remove config dir: {}", e)),
+        }
+    }
+
+    println!();
+    green_box("UNINSTALL COMPLETE");
+    println!();
+    info("The andromeda CLI binary itself is still installed.");
+    info("To remove it, delete andromeda[.exe] from your PATH directory.");
+    println!();
 }
 
 // ─── Command: tunnel cloudflare ──────────────────────────────────────────────
@@ -667,8 +1109,7 @@ async fn cmd_tunnel_cloudflare() -> Result<()> {
         .stderr(Stdio::piped())
         .spawn()?;
 
-    // cloudflared logs the URL to stderr
-    let stderr  = child.stderr.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
     let mut lines   = BufReader::new(stderr).lines();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut public_url: Option<String> = None;
@@ -747,7 +1188,6 @@ async fn cmd_tunnel_ngrok() -> Result<()> {
         .stdout(Stdio::null()).stderr(Stdio::null())
         .spawn()?;
 
-    // Poll ngrok local API for the public URL
     let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
     let mut public_url: Option<String> = None;
 
@@ -921,10 +1361,15 @@ async fn cmd_setup(repo: &str) -> Result<()> {
     dim("  andromeda stop                 — stop dashboard");
     dim("  andromeda restart              — restart dashboard");
     dim("  andromeda status               — show status + URLs");
+    dim("  andromeda open                 — open in browser");
+    dim("  andromeda logs -f              — follow dashboard logs");
+    dim("  andromeda doctor               — health check");
     dim("  andromeda tunnel cloudflare    — open free internet tunnel");
     dim("  andromeda tunnel ngrok         — open ngrok tunnel");
     dim("  andromeda apikey               — show API key");
     dim("  andromeda apikey new           — rotate API key");
+    dim("  andromeda version              — version + update check");
+    dim("  andromeda config show          — show all config");
     println!();
     Ok(())
 }
@@ -936,8 +1381,9 @@ async fn main() {
     let cli = Cli::parse();
 
     let result: Result<()> = match cli.command {
+        Commands::Version { repo }         => { cmd_version(&repo).await; Ok(()) }
         Commands::Install { repo }         => cmd_install(&repo).await,
-        Commands::Update  { repo }         => cmd_install(&repo).await,
+        Commands::Update  { repo }         => cmd_update(&repo).await,
         Commands::Start   { foreground }   => cmd_start(foreground).await,
         Commands::Stop                     => { cmd_stop(); Ok(()) }
         Commands::Restart                  => {
@@ -946,16 +1392,25 @@ async fn main() {
             cmd_start(false).await
         }
         Commands::Status                   => { cmd_status().await; Ok(()) }
+        Commands::Open                     => { cmd_open(); Ok(()) }
+        Commands::Logs { follow, lines }   => { cmd_logs(follow, lines); Ok(()) }
+        Commands::Doctor                   => { cmd_doctor().await; Ok(()) }
         Commands::Apikey  { action }       => match action.unwrap_or(ApikeyAction::Show) {
-            ApikeyAction::Show       => { cmd_apikey_show(); Ok(()) }
-            ApikeyAction::Set { key} => { cmd_apikey_set(&key); Ok(()) }
-            ApikeyAction::New        => { cmd_apikey_new(); Ok(()) }
+            ApikeyAction::Show        => { cmd_apikey_show(); Ok(()) }
+            ApikeyAction::Set { key } => { cmd_apikey_set(&key); Ok(()) }
+            ApikeyAction::New         => { cmd_apikey_new(); Ok(()) }
         },
         Commands::Tunnel { kind }          => match kind {
             TunnelKind::Cloudflare => cmd_tunnel_cloudflare().await,
             TunnelKind::Ngrok      => cmd_tunnel_ngrok().await,
         },
         Commands::Ipv6                     => { cmd_ipv6(); Ok(()) }
+        Commands::Config  { action }       => match action {
+            ConfigCmd::Show         => { cmd_config_show(); Ok(()) }
+            ConfigCmd::Port { port }    => { cmd_config_set_port(port); Ok(()) }
+            ConfigCmd::Binary { path }  => { cmd_config_set_binary(&path); Ok(()) }
+        },
+        Commands::Uninstall { yes }        => { cmd_uninstall(yes); Ok(()) }
         Commands::Setup { repo }           => cmd_setup(&repo).await,
     };
 
