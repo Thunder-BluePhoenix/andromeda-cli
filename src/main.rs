@@ -5,7 +5,7 @@
 //   andromeda version              — CLI version + dashboard version + update check
 //   andromeda install              — download dashboard binary from GitHub
 //   andromeda update               — smart update (skips if already latest)
-//   andromeda start [--foreground] — start dashboard (background by default)
+//   andromeda start [--detach]     — start dashboard (attaches to logs by default)
 //   andromeda stop                 — stop dashboard
 //   andromeda restart              — restart dashboard
 //   andromeda status               — show status + URLs
@@ -65,11 +65,11 @@ enum Commands {
         #[arg(long, default_value = "Thunder-BluePhoenix/andromeda-releases")]
         repo: String,
     },
-    /// Start the Andromeda dashboard
+    /// Start the Andromeda dashboard (follows logs; Ctrl+C stops it)
     Start {
-        /// Block and stream logs instead of running in background
-        #[arg(long)]
-        foreground: bool,
+        /// Detach — start in background without following logs
+        #[arg(long, short = 'd')]
+        detach: bool,
     },
     /// Stop the running Andromeda dashboard
     Stop,
@@ -242,6 +242,18 @@ fn green_box(title: &str) {
     println!("\x1b[0m");
 }
 
+fn print_banner() {
+    let version = env!("CARGO_PKG_VERSION");
+    println!("\x1b[36m █████╗ ███╗   ██╗██████╗ ██████╗  ██████╗ ███╗   ███╗███████╗██████╗  █████╗ \x1b[0m");
+    println!("\x1b[36m██╔══██╗████╗  ██║██╔══██╗██╔══██╗██╔═══██╗████╗ ████║██╔════╝██╔══██╗██╔══██╗\x1b[0m");
+    println!("\x1b[36m███████║██╔██╗ ██║██║  ██║██████╔╝██║   ██║██╔████╔██║█████╗  ██║  ██║███████║\x1b[0m");
+    println!("\x1b[36m██╔══██║██║╚██╗██║██║  ██║██╔══██╗██║   ██║██║╚██╔╝██║██╔══╝  ██║  ██║██╔══██║\x1b[0m");
+    println!("\x1b[36m██║  ██║██║ ╚████║██████╔╝██║  ██║╚██████╔╝██║ ╚═╝ ██║███████╗██████╔╝██║  ██║\x1b[0m");
+    println!("\x1b[36m╚═╝  ╚═╝╚═╝  ╚═══╝╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝╚═════╝ ╚═╝  ╚═╝\x1b[0m");
+    println!("\x1b[90m Server Engine — v{}\x1b[0m", version);
+    println!();
+}
+
 // ─── Key generation ───────────────────────────────────────────────────────────
 
 fn gen_key() -> String {
@@ -335,6 +347,44 @@ fn do_spawn(cmd: &mut std::process::Command) -> Result<std::process::Child> {
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
     cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
         .spawn().context("spawn dashboard")
+}
+
+/// Stream new lines from the log file to stdout until the process with `pid`
+/// is no longer alive.  Returns when the dashboard exits (natural or killed).
+async fn follow_log_until_exit(pid: u32) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use std::io::Write;
+
+    let path = log_path();
+    // Wait briefly for the log file to be created by the dashboard process.
+    for _ in 0..20 {
+        if path.exists() { break; }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    let mut reader = BufReader::new(file);
+    let mut line   = String::new();
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => {
+                // EOF — check whether the process is still alive.
+                if !process_alive(pid) { return; }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Ok(_) => {
+                print!("{}", line);
+                let _ = std::io::stdout().flush();
+            }
+            Err(_) => return,
+        }
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -688,14 +738,14 @@ async fn cmd_update(repo: &str) -> Result<()> {
 
     if was_running {
         info("Restarting dashboard...");
-        Box::pin(cmd_start(false)).await?;
+        Box::pin(cmd_start(true)).await?;  // detach: update restarts silently
     }
     Ok(())
 }
 
 // ─── Command: start ──────────────────────────────────────────────────────────
 
-async fn cmd_start(foreground: bool) -> Result<()> {
+async fn cmd_start(detach: bool) -> Result<()> {
     let cfg = load_config();
     let binary = cfg.binary();
 
@@ -718,15 +768,9 @@ async fn cmd_start(foreground: bool) -> Result<()> {
     let key  = cfg.api_key.clone().unwrap_or_else(gen_key);
     let port = cfg.port();
 
-    if foreground {
-        info("Running in foreground — press Ctrl+C to stop.");
-        std::process::Command::new(&binary)
-            .env("ANDROMEDA_API_KEY", &key)
-            .env("ANDROMEDA_PORT", port.to_string())
-            .status()?;
-        return Ok(());
-    }
-
+    // Always spawn via background helper (stdout/stderr → log file, PID saved).
+    // This ensures `andromeda stop` / `andromeda restart` from another terminal
+    // always work regardless of whether we attach to the log or not.
     let pid = spawn_bg(&binary, &key, port)?;
     write_pid(pid)?;
     ok(&format!("Dashboard starting (PID {})...", pid));
@@ -737,6 +781,7 @@ async fn cmd_start(foreground: bool) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(500)).await;
         if !process_alive(pid) {
             err("Dashboard exited during startup.");
+            err("Run `andromeda logs` to see why.");
             clear_pid();
             return Ok(());
         }
@@ -748,7 +793,7 @@ async fn cmd_start(foreground: bool) -> Result<()> {
     if !process_alive(pid) {
         err("Dashboard crashed during startup.");
         err("Check the log for details:");
-        info(&format!("  andromeda logs"));
+        info("  andromeda logs");
         info(&format!("  {}", log_path().display()));
         clear_pid();
         return Ok(());
@@ -771,10 +816,41 @@ async fn cmd_start(foreground: bool) -> Result<()> {
         println!("  Internet  :  http://{}:{}  (forward port {} on your router)", ip, port, port);
     }
     println!();
-    dim("andromeda stop              — stop the dashboard");
-    dim("andromeda open              — open in browser");
-    dim("andromeda tunnel cloudflare — open a free internet tunnel");
-    dim(&format!("andromeda logs -f           — follow dashboard logs"));
+
+    if detach {
+        // Detach mode: print hints then exit — dashboard keeps running.
+        dim("andromeda stop              — stop the dashboard");
+        dim("andromeda open              — open in browser");
+        dim("andromeda logs -f           — follow dashboard logs");
+        dim("andromeda tunnel cloudflare — open a free internet tunnel");
+        return Ok(());
+    }
+
+    // ── Attached mode (default) ───────────────────────────────────────────────
+    // Stream the dashboard log to this terminal.
+    // Ctrl+C here stops the dashboard.
+    // `andromeda stop` / `andromeda restart` from another terminal also work.
+    dim("─────────────────────────────────────────────────────────────────");
+    dim("Attached to dashboard — Ctrl+C to stop.");
+    dim("To stop from another terminal: andromeda stop");
+    dim("─────────────────────────────────────────────────────────────────");
+    println!();
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            println!();
+            ok("Stopping dashboard...");
+            kill_pid(pid);
+            clear_pid();
+        }
+        _ = follow_log_until_exit(pid) => {
+            // Dashboard exited on its own (killed from another terminal, etc.).
+            clear_pid();
+            println!();
+            warn("Dashboard stopped.");
+        }
+    }
+
     Ok(())
 }
 
@@ -1415,18 +1491,19 @@ async fn cmd_setup(repo: &str) -> Result<()> {
 
 #[tokio::main]
 async fn main() {
+    print_banner();
     let cli = Cli::parse();
 
     let result: Result<()> = match cli.command {
         Commands::Version { repo }         => { cmd_version(&repo).await; Ok(()) }
         Commands::Install { repo }         => cmd_install(&repo).await,
         Commands::Update  { repo }         => cmd_update(&repo).await,
-        Commands::Start   { foreground }   => cmd_start(foreground).await,
+        Commands::Start   { detach }       => cmd_start(detach).await,
         Commands::Stop                     => { cmd_stop(); Ok(()) }
         Commands::Restart                  => {
             cmd_stop();
             tokio::time::sleep(Duration::from_millis(800)).await;
-            cmd_start(false).await
+            cmd_start(true).await  // detach: restart silently, don't re-attach
         }
         Commands::Status                   => { cmd_status().await; Ok(()) }
         Commands::Open                     => { cmd_open(); Ok(()) }
