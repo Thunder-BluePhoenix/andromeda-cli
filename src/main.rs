@@ -342,7 +342,7 @@ fn do_spawn(cmd: &mut std::process::Command) -> Result<std::process::Child> {
     cmd.spawn().context("spawn dashboard")
 }
 
-fn spawn_bg(binary: &PathBuf, api_key: &str) -> Result<u32> {
+fn spawn_bg(binary: &PathBuf, api_key: &str, port: u16) -> Result<u32> {
     std::fs::create_dir_all(config_dir())?;
 
     // Rotate log if > 10 MB to avoid unbounded growth
@@ -361,9 +361,17 @@ fn spawn_bg(binary: &PathBuf, api_key: &str) -> Result<u32> {
 
     let mut cmd = std::process::Command::new(binary);
     cmd.env("ANDROMEDA_API_KEY", api_key)
+       .env("ANDROMEDA_PORT", port.to_string())
        .stdin(Stdio::null())
        .stdout(Stdio::from(log_file))
        .stderr(Stdio::from(err_file));
+
+    // Run the dashboard from its own directory so relative file paths
+    // (static assets, databases, config files) resolve correctly.
+    if let Some(dir) = binary.parent() {
+        cmd.current_dir(dir);
+    }
+
     Ok(do_spawn(&mut cmd)?.id())
 }
 
@@ -663,6 +671,15 @@ async fn cmd_update(repo: &str) -> Result<()> {
         std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
     }
 
+    // macOS silently blocks unsigned binaries downloaded from the internet
+    // (Gatekeeper quarantine). Remove the attribute so the dashboard can run.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("xattr")
+            .args(["-d", "com.apple.quarantine", &dest.to_string_lossy().into_owned()])
+            .output();
+    }
+
     let mut cfg = load_config();
     cfg.installed_version = Some(latest_tag.clone());
     save_config(&cfg)?;
@@ -705,11 +722,12 @@ async fn cmd_start(foreground: bool) -> Result<()> {
         info("Running in foreground — press Ctrl+C to stop.");
         std::process::Command::new(&binary)
             .env("ANDROMEDA_API_KEY", &key)
+            .env("ANDROMEDA_PORT", port.to_string())
             .status()?;
         return Ok(());
     }
 
-    let pid = spawn_bg(&binary, &key)?;
+    let pid = spawn_bg(&binary, &key, port)?;
     write_pid(pid)?;
     ok(&format!("Dashboard starting (PID {})...", pid));
 
