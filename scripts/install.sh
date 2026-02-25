@@ -73,10 +73,8 @@ TAG=$(echo "$RELEASE_JSON" | grep '"tag_name"' \
     | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1)
 
 DOWNLOAD_URL=$(echo "$RELEASE_JSON" \
-    | grep '"browser_download_url"' \
-    | grep "\"${ASSET_NAME}\"" \
-    | sed 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' \
-    | head -1)
+    | grep -o "\"browser_download_url\":\"https://[^\"]*/${ASSET_NAME}\"" \
+    | grep -o 'https://[^"]*')
 
 if [[ -z "$DOWNLOAD_URL" ]]; then
     err "Asset '${ASSET_NAME}' not found in release ${TAG}."
