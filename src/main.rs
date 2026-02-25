@@ -213,6 +213,33 @@ fn read_pid() -> Option<u32> {
 
 fn clear_pid() { let _ = std::fs::remove_file(pid_path()); }
 
+// ─── Terminal init ────────────────────────────────────────────────────────────
+
+// On Windows, ANSI/VT100 escape codes require ENABLE_VIRTUAL_TERMINAL_PROCESSING
+// to be set on the console handle.  Modern Windows Terminal sets this automatically,
+// but legacy conhost.exe (classic PowerShell / cmd windows) does not.
+#[cfg(target_os = "windows")]
+extern "system" {
+    fn GetStdHandle(nStdHandle: u32) -> *mut std::ffi::c_void;
+    fn GetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, lpMode: *mut u32) -> i32;
+    fn SetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, dwMode: u32) -> i32;
+}
+
+fn init_terminal() {
+    #[cfg(target_os = "windows")]
+    {
+        unsafe {
+            const STD_OUTPUT_HANDLE: u32 = 0xFFFFFFF5;
+            const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+            let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+            let mut mode: u32 = 0;
+            if GetConsoleMode(handle, &mut mode) != 0 {
+                SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            }
+        }
+    }
+}
+
 // ─── Output helpers ───────────────────────────────────────────────────────────
 
 fn ok(s: &str)   { println!("\x1b[32m  [+]\x1b[0m {}", s); }
@@ -250,7 +277,7 @@ fn print_banner() {
     println!("\x1b[36m██╔══██║██║╚██╗██║██║  ██║██╔══██╗██║   ██║██║╚██╔╝██║██╔══╝  ██║  ██║██╔══██║\x1b[0m");
     println!("\x1b[36m██║  ██║██║ ╚████║██████╔╝██║  ██║╚██████╔╝██║ ╚═╝ ██║███████╗██████╔╝██║  ██║\x1b[0m");
     println!("\x1b[36m╚═╝  ╚═╝╚═╝  ╚═══╝╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝╚═════╝ ╚═╝  ╚═╝\x1b[0m");
-    println!("\x1b[90m Server Engine — v{}\x1b[0m", version);
+    println!("\x1b[90m Server Intelligence Engine — v{}\x1b[0m", version);
     println!();
 }
 
@@ -349,10 +376,55 @@ fn do_spawn(cmd: &mut std::process::Command) -> Result<std::process::Child> {
         .spawn().context("spawn dashboard")
 }
 
-/// Stream new lines from the log file to stdout until the process with `pid`
-/// is no longer alive.  Returns when the dashboard exits (natural or killed).
-async fn follow_log_until_exit(pid: u32) {
-    use tokio::io::{AsyncBufReadExt, BufReader};
+/// Returns the current size of the log file (used as the "start of this run"
+/// offset so log tailing only shows output from the current spawn).
+fn current_log_offset() -> u64 {
+    std::fs::metadata(log_path()).map(|m| m.len()).unwrap_or(0)
+}
+
+/// After spawning the dashboard, scan the log from `start_offset` forward and
+/// return the port it actually bound to.  This handles the case where the
+/// configured port (e.g. 3000) was already occupied and the dashboard chose
+/// the next available one (e.g. 3001).  Times out after 15 s.
+async fn detect_actual_port(start_offset: u64, pid: u32) -> Option<u16> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let path = log_path();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+
+    loop {
+        if tokio::time::Instant::now() > deadline { return None; }
+        if !process_alive(pid)                    { return None; }
+
+        if let Ok(mut file) = tokio::fs::File::open(&path).await {
+            if file.seek(tokio::io::SeekFrom::Start(start_offset)).await.is_ok() {
+                let mut buf = String::new();
+                let _ = file.read_to_string(&mut buf).await;
+                // Dashboard prints: "Localhost:  http://localhost:PORT?api_key=..."
+                for line in buf.lines() {
+                    if let Some(rest) = line.strip_prefix("Localhost:") {
+                        if let Some(port_part) = rest.split("http://localhost:").nth(1) {
+                            if let Ok(p) = port_part.split('?').next()
+                                .unwrap_or("").trim().parse::<u16>()
+                            {
+                                return Some(p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Stream new lines from the log file (starting at `start_offset`) to stdout
+/// until the process with `pid` is no longer alive.
+/// Using `start_offset` ensures we only show output from this run, not all
+/// previous runs stored in the same log file.
+async fn follow_log_until_exit(pid: u32, start_offset: u64) {
+    use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader};
     use std::io::Write;
 
     let path = log_path();
@@ -362,10 +434,13 @@ async fn follow_log_until_exit(pid: u32) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    let file = match tokio::fs::File::open(&path).await {
+    let mut file = match tokio::fs::File::open(&path).await {
         Ok(f) => f,
         Err(_) => return,
     };
+
+    // Skip all output that existed before this run.
+    let _ = file.seek(tokio::io::SeekFrom::Start(start_offset)).await;
 
     let mut reader = BufReader::new(file);
     let mut line   = String::new();
@@ -765,8 +840,26 @@ async fn cmd_start(detach: bool) -> Result<()> {
         clear_pid();
     }
 
-    let key  = cfg.api_key.clone().unwrap_or_else(gen_key);
-    let port = cfg.port();
+    let key       = cfg.api_key.clone().unwrap_or_else(gen_key);
+    let port      = cfg.port();
+
+    // Check if the configured port is already in use by an untracked process
+    // (e.g. an orphaned dashboard from a previous crash, or a `cargo run` session).
+    // The dashboard can auto-select the next port (3001, 3002 …) so this is just
+    // a helpful warning — we still spawn and let the dashboard pick a free port.
+    if port_open(port) {
+        warn(&format!("Port {} is already in use — the dashboard will try the next available port.", port));
+        if cfg!(target_os = "macos") || cfg!(target_os = "linux") {
+            info(&format!("  To free it:  kill $(lsof -ti :{}) 2>/dev/null", port));
+        } else {
+            info(&format!("  To find it:  netstat -ano | findstr :{}", port));
+        }
+    }
+
+    // Snapshot the log file size before spawning so we can:
+    //  1. Only tail output from THIS run (not historical runs).
+    //  2. Scan only the new output to detect the actual port chosen.
+    let log_offset = current_log_offset();
 
     // Always spawn via background helper (stdout/stderr → log file, PID saved).
     // This ensures `andromeda stop` / `andromeda restart` from another terminal
@@ -775,26 +868,36 @@ async fn cmd_start(detach: bool) -> Result<()> {
     write_pid(pid)?;
     ok(&format!("Dashboard starting (PID {})...", pid));
 
-    // Wait up to 15 s for the port to open
-    let mut bound = false;
-    for _ in 0..30 {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        if !process_alive(pid) {
-            err("Dashboard exited during startup.");
-            err("Run `andromeda logs` to see why.");
-            clear_pid();
+    // Wait for the dashboard to print its startup banner (up to 15 s).
+    // detect_actual_port reads the log from log_offset and returns the port
+    // the dashboard really bound to — which may differ from `port` if that
+    // port was already occupied by another process.
+    let actual_port = match detect_actual_port(log_offset, pid).await {
+        Some(p) => p,
+        None => {
+            if !process_alive(pid) {
+                err("Dashboard exited during startup.");
+                err("Run `andromeda logs` to see why:");
+                info("  andromeda logs");
+                clear_pid();
+            } else {
+                warn("Dashboard didn't report ready within 15 s — may still be starting.");
+                info("Try: andromeda logs -f");
+            }
             return Ok(());
         }
-        if port_open(port) { bound = true; break; }
-    }
-    if !bound { warn("Port not open within 15 s — may still be starting."); }
+    };
 
-    // Final check: process might have crashed right after the port opened
+    // Small delay then verify the process didn't crash right after printing
+    // its banner (e.g. the IPv6 bind-order bug on older macOS binaries).
+    tokio::time::sleep(Duration::from_millis(300)).await;
     if !process_alive(pid) {
-        err("Dashboard crashed during startup.");
-        err("Check the log for details:");
+        err("Dashboard crashed immediately after startup.");
+        err("Run `andromeda logs` to see the error:");
         info("  andromeda logs");
-        info(&format!("  {}", log_path().display()));
+        if cfg!(target_os = "macos") || cfg!(target_os = "linux") {
+            info(&format!("  To free port {}:  kill $(lsof -ti :{}) 2>/dev/null", actual_port, actual_port));
+        }
         clear_pid();
         return Ok(());
     }
@@ -806,14 +909,14 @@ async fn cmd_start(detach: bool) -> Result<()> {
     println!();
     green_box("ANDROMEDA IS RUNNING");
     println!();
-    println!("  Localhost :  \x1b[37mhttp://localhost:{}?api_key={}\x1b[0m", port, key);
-    println!("  LAN       :  \x1b[37mhttp://{}:{}?api_key={}\x1b[0m", lan, port, key);
+    println!("  Localhost :  \x1b[37mhttp://localhost:{}?api_key={}\x1b[0m", actual_port, key);
+    println!("  LAN       :  \x1b[37mhttp://{}:{}?api_key={}\x1b[0m", lan, actual_port, key);
     if let Some(v6) = &v6 {
-        println!("  IPv6      :  \x1b[32mhttp://[{}]:{}?api_key={}\x1b[0m", v6, port, key);
+        println!("  IPv6      :  \x1b[32mhttp://[{}]:{}?api_key={}\x1b[0m", v6, actual_port, key);
         println!("               ^ internet access — no router setup needed!");
     }
     if let Some(ip) = &wan {
-        println!("  Internet  :  http://{}:{}  (forward port {} on your router)", ip, port, port);
+        println!("  Internet  :  http://{}:{}  (forward port {} on your router)", ip, actual_port, actual_port);
     }
     println!();
 
@@ -827,7 +930,8 @@ async fn cmd_start(detach: bool) -> Result<()> {
     }
 
     // ── Attached mode (default) ───────────────────────────────────────────────
-    // Stream the dashboard log to this terminal.
+    // Stream the dashboard log to this terminal, starting from log_offset so
+    // only output from THIS run is shown (not replayed historical output).
     // Ctrl+C here stops the dashboard.
     // `andromeda stop` / `andromeda restart` from another terminal also work.
     dim("─────────────────────────────────────────────────────────────────");
@@ -843,7 +947,7 @@ async fn cmd_start(detach: bool) -> Result<()> {
             kill_pid(pid);
             clear_pid();
         }
-        _ = follow_log_until_exit(pid) => {
+        _ = follow_log_until_exit(pid, log_offset) => {
             // Dashboard exited on its own (killed from another terminal, etc.).
             clear_pid();
             println!();
@@ -1491,6 +1595,7 @@ async fn cmd_setup(repo: &str) -> Result<()> {
 
 #[tokio::main]
 async fn main() {
+    init_terminal();
     print_banner();
     let cli = Cli::parse();
 
