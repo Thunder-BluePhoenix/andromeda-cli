@@ -726,6 +726,16 @@ async fn cmd_start(foreground: bool) -> Result<()> {
     }
     if !bound { warn("Port not open within 15 s — may still be starting."); }
 
+    // Final check: process might have crashed right after the port opened
+    if !process_alive(pid) {
+        err("Dashboard crashed during startup.");
+        err("Check the log for details:");
+        info(&format!("  andromeda logs"));
+        info(&format!("  {}", log_path().display()));
+        clear_pid();
+        return Ok(());
+    }
+
     let lan = local_ip();
     let v6  = ipv6_addr();
     let wan = public_ip().await;
