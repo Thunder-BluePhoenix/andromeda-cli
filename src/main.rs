@@ -7,6 +7,7 @@
 //   andromeda update               — smart update (skips if already latest)
 //   andromeda start [--detach]     — start dashboard (attaches to logs by default)
 //   andromeda stop                 — stop dashboard
+//   andromeda killall              — kill all andromeda-dashboard processes on any port
 //   andromeda restart              — restart dashboard
 //   andromeda status               — show status + URLs
 //   andromeda open                 — open dashboard in default browser
@@ -73,6 +74,8 @@ enum Commands {
     },
     /// Stop the running Andromeda dashboard
     Stop,
+    /// Kill ALL running Andromeda dashboard processes on any port
+    Killall,
     /// Restart the Andromeda dashboard
     Restart,
     /// Show dashboard status and access URLs
@@ -282,7 +285,7 @@ fn print_banner() {
     println!("\x1b[36m██╔══██║██║╚██╗██║██║  ██║██╔══██╗██║   ██║██║╚██╔╝██║██╔══╝  ██║  ██║██╔══██║\x1b[0m");
     println!("\x1b[36m██║  ██║██║ ╚████║██████╔╝██║  ██║╚██████╔╝██║ ╚═╝ ██║███████╗██████╔╝██║  ██║\x1b[0m");
     println!("\x1b[36m╚═╝  ╚═╝╚═╝  ╚═══╝╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝╚══════╝╚═════╝ ╚═╝  ╚═╝\x1b[0m");
-    println!("\x1b[90m Server Intelligence Engine — v{}\x1b[0m", version);
+    println!("\x1b[90m Runtime Intelligence Engine — v{}\x1b[0m", version);
     println!();
 }
 
@@ -369,6 +372,62 @@ fn kill_pid(pid: u32) -> bool {
             .args([&pid.to_string()])
             .stdout(Stdio::null()).stderr(Stdio::null())
             .status().map(|s| s.success()).unwrap_or(false)
+    }
+}
+
+/// Kill ALL running andromeda-dashboard processes — including orphans that are
+/// not tracked by the PID file (e.g. left over from `cargo run`, crashes, or
+/// multiple CLI invocations).  Returns the count of PIDs targeted.
+fn kill_all_andromeda() -> u32 {
+    let mut killed = 0u32;
+
+    #[cfg(target_os = "windows")]
+    {
+        // Kill by image name — handles both the installed binary and any dev builds.
+        std::process::Command::new("taskkill")
+            .args(["/F", "/IM", "andromeda-dashboard.exe"])
+            .stdout(Stdio::null()).stderr(Stdio::null())
+            .status().ok();
+        // Count any survivors so the caller knows something happened
+        let running = std::process::Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq andromeda-dashboard.exe", "/NH", "/FO", "CSV"])
+            .stdout(Stdio::piped()).stderr(Stdio::null())
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("andromeda-dashboard.exe"))
+            .unwrap_or(false);
+        if !running { killed = 1; } // taskkill succeeded
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // pgrep -f matches against the full command line, catching any port.
+        if let Ok(out) = std::process::Command::new("pgrep")
+            .args(["-f", "andromeda-dashboard"])
+            .output()
+        {
+            let pids: Vec<u32> = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect();
+            killed = pids.len() as u32;
+            for pid in pids {
+                kill_pid(pid);
+            }
+        }
+    }
+
+    clear_pid();
+    killed
+}
+
+/// Command: killall — stop every andromeda-dashboard process on the system.
+fn cmd_killall() {
+    cyan_box("ANDROMEDA — KILL ALL");
+    let n = kill_all_andromeda();
+    if n > 0 {
+        ok(&format!("All andromeda-dashboard processes stopped ({} killed).", n));
+    } else {
+        info("No running andromeda-dashboard processes found.");
     }
 }
 
@@ -726,9 +785,34 @@ async fn cmd_install(repo: &str) -> Result<()> {
     ok(&format!("Release    : {}", tag));
 
     let dest = default_binary_path();
+
+    // Kill any running dashboard before overwriting its binary (Windows file-lock).
+    let n = kill_all_andromeda();
+    if n > 0 {
+        info("Stopped running dashboard for install...");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    }
+
     hdr("DOWNLOADING");
     info(&format!("→ {}", dest.display()));
 
+    // Retry on Windows in case the process just released the file lock.
+    #[cfg(target_os = "windows")]
+    {
+        let mut attempt = 0u32;
+        loop {
+            match download_to(&url, &dest).await {
+                Ok(()) => break,
+                Err(e) if e.to_string().contains("32") && attempt < 5 => {
+                    attempt += 1;
+                    info(&format!("  File still locked, retrying ({}/5)...", attempt));
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
     download_to(&url, &dest).await?;
 
     #[cfg(not(target_os = "windows"))]
@@ -783,17 +867,41 @@ async fn cmd_update(repo: &str) -> Result<()> {
         return Ok(());
     }
 
-    // Stop if running, download, optionally restart
+    // Kill ALL running instances before overwriting — on Windows a running process
+    // locks its binary file and the write would fail with os error 32.
     let was_running = read_pid().map(process_alive).unwrap_or(false);
-    if was_running {
-        info("Stopping dashboard for update...");
-        cmd_stop();
-        tokio::time::sleep(Duration::from_millis(800)).await;
+    {
+        let n = kill_all_andromeda();
+        if n > 0 || was_running {
+            info("Stopped running dashboard(s)...");
+            // Give the OS time to release the file lock (especially important on Windows).
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
     }
 
     let dest = cfg.binary();
     hdr("DOWNLOADING");
     info(&format!("→ {}", dest.display()));
+
+    // On Windows, the old process may still hold a file lock for a moment after
+    // being killed.  Retry up to 5 times with a short pause between attempts.
+    #[cfg(target_os = "windows")]
+    {
+        let mut attempt = 0u32;
+        loop {
+            match download_to(&url, &dest).await {
+                Ok(()) => break,
+                // os error 32 = ERROR_SHARING_VIOLATION (file still locked)
+                Err(e) if e.to_string().contains("32") && attempt < 5 => {
+                    attempt += 1;
+                    info(&format!("  File still locked, retrying ({}/5)...", attempt));
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
     download_to(&url, &dest).await?;
 
     #[cfg(not(target_os = "windows"))]
@@ -836,31 +944,20 @@ async fn cmd_start(detach: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Already running?
+    // Already running? Stop it first, then start fresh (auto-restart).
     if let Some(pid) = read_pid() {
         if process_alive(pid) {
-            warn(&format!("Dashboard already running (PID {})", pid));
-            info(&format!("  http://localhost:{}?api_key={}", cfg.port(), cfg.api_key()));
-            return Ok(());
-        }
-        clear_pid();
-    }
-
-    let key       = cfg.api_key.clone().unwrap_or_else(gen_key);
-    let port      = cfg.port();
-
-    // Check if the configured port is already in use by an untracked process
-    // (e.g. an orphaned dashboard from a previous crash, or a `cargo run` session).
-    // The dashboard can auto-select the next port (3001, 3002 …) so this is just
-    // a helpful warning — we still spawn and let the dashboard pick a free port.
-    if port_open(port) {
-        warn(&format!("Port {} is already in use — the dashboard will try the next available port.", port));
-        if cfg!(target_os = "macos") || cfg!(target_os = "linux") {
-            info(&format!("  To free it:  kill $(lsof -ti :{}) 2>/dev/null", port));
+            info(&format!("Dashboard already running (PID {}) — stopping first...", pid));
+            kill_pid(pid);
+            clear_pid();
+            tokio::time::sleep(Duration::from_millis(800)).await;
         } else {
-            info(&format!("  To find it:  netstat -ano | findstr :{}", port));
+            clear_pid();
         }
     }
+
+    let key  = cfg.api_key.clone().unwrap_or_else(gen_key);
+    let port = cfg.port();
 
     // Snapshot the log file size before spawning so we can:
     //  1. Only tail output from THIS run (not historical runs).
@@ -1781,6 +1878,7 @@ async fn main() {
         Commands::Update  { repo }         => cmd_update(&repo).await,
         Commands::Start   { detach }       => cmd_start(detach).await,
         Commands::Stop                     => { cmd_stop(); Ok(()) }
+        Commands::Killall                  => { cmd_killall(); Ok(()) }
         Commands::Restart                  => {
             cmd_stop();
             tokio::time::sleep(Duration::from_millis(800)).await;
