@@ -131,6 +131,6 @@ jobs:
           Copy-Item "target\${{ matrix.target }}\release\${{ matrix.binary }}" "${{ matrix.asset_name }}"
 
       - name: Upload binary to release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: ${{ matrix.asset_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload ${{ github.ref_name }} ${{ matrix.asset_name }} --clobber

@@ -598,6 +598,15 @@ async fn cmd_install(repo: &str) -> Result<()> {
         std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
     }
 
+    // macOS silently blocks unsigned binaries downloaded from the internet
+    // (Gatekeeper quarantine). Remove the attribute so the dashboard can run.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("xattr")
+            .args(["-d", "com.apple.quarantine", &dest.to_string_lossy().into_owned()])
+            .output();
+    }
+
     let mut cfg = load_config();
     cfg.binary_path        = Some(dest.to_string_lossy().into());
     cfg.dashboard_repo     = Some(repo.into());
