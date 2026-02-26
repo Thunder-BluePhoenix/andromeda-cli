@@ -1201,6 +1201,42 @@ async fn cmd_start(detach: bool) -> Result<()> {
     }
     println!();
 
+    // On Linux, warn if UFW is active and the port hasn't been opened.
+    // This is the most common reason the dashboard is unreachable from other devices.
+    // The dashboard may use any port in the range base..base+9 if base is busy.
+    #[cfg(target_os = "linux")]
+    {
+        let ufw_out = std::process::Command::new("sudo")
+            .args(["ufw", "status"])
+            .stdout(Stdio::piped()).stderr(Stdio::null())
+            .output().ok();
+        if let Some(out) = ufw_out {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if text.contains("Status: active") {
+                let base_port = cfg.port();
+                let port_str  = actual_port.to_string();
+                // A UFW rule may be a single port ("3000/tcp") or a range ("3000:3009/tcp").
+                let open = text.lines().any(|l| {
+                    if !(l.contains("ALLOW") || l.contains("allow")) { return false; }
+                    let rule = l.split_whitespace().next().unwrap_or("").split('/').next().unwrap_or("");
+                    if rule.contains(':') {
+                        let mut parts = rule.split(':');
+                        let lo: u16 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                        let hi: u16 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                        actual_port >= lo && actual_port <= hi
+                    } else {
+                        rule == port_str
+                    }
+                });
+                if !open {
+                    warn(&format!("UFW firewall: port {} is not open — LAN/internet access blocked.", actual_port));
+                    info(&format!("  Fix:  sudo ufw allow {}:{}/tcp", base_port, base_port + 9));
+                }
+            }
+        }
+        println!();
+    }
+
     if detach {
         // Detach mode: print hints then exit — dashboard keeps running.
         dim("andromeda stop              — stop the dashboard");
@@ -1432,6 +1468,42 @@ async fn cmd_doctor() {
     match find_bin("ngrok") {
         Some(p) => ok(&format!("ngrok            : {}", p)),
         None    => info("ngrok            : not installed (optional)"),
+    }
+
+    // Linux: UFW firewall check
+    // The dashboard tries ports base..base+9 so check if the active port (or its
+    // range) is covered by a UFW ALLOW rule.
+    #[cfg(target_os = "linux")]
+    {
+        let ufw_out = std::process::Command::new("sudo")
+            .args(["ufw", "status"])
+            .stdout(Stdio::piped()).stderr(Stdio::null())
+            .output().ok();
+        if let Some(out) = ufw_out {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if text.contains("Status: active") {
+                let port_str = port.to_string();
+                let open = text.lines().any(|l| {
+                    if !(l.contains("ALLOW") || l.contains("allow")) { return false; }
+                    let rule = l.split_whitespace().next().unwrap_or("").split('/').next().unwrap_or("");
+                    if rule.contains(':') {
+                        let mut parts = rule.split(':');
+                        let lo: u16 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                        let hi: u16 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                        port >= lo && port <= hi
+                    } else {
+                        rule == port_str
+                    }
+                });
+                if open {
+                    ok(&format!("UFW              : active, port {}/tcp OPEN", port));
+                } else {
+                    warn(&format!("UFW              : active, port {} BLOCKED — run: sudo ufw allow {}:{}/tcp", port, port, port + 9));
+                }
+            } else {
+                info("UFW              : inactive (no firewall restrictions)");
+            }
+        }
     }
 
     println!();
@@ -1967,6 +2039,61 @@ fn setup_permissions(cfg: &mut Config) -> Result<()> {
                 ok("All required system libraries are present.");
             }
             // linux_check_deps already prints instructions if anything is missing.
+        }
+
+        // Check UFW firewall — Ubuntu blocks all incoming ports by default.
+        // The dashboard may use any port in base..base+9 (auto-selects next free port),
+        // so we open the whole range to avoid re-running setup if the base port is busy.
+        {
+            use std::io::Write;
+            let port = cfg.port();
+            let ufw_status = std::process::Command::new("sudo")
+                .args(["ufw", "status"])
+                .stdout(Stdio::piped()).stderr(Stdio::null())
+                .output();
+            if let Ok(out) = ufw_status {
+                let text = String::from_utf8_lossy(&out.stdout);
+                if text.contains("Status: active") {
+                    hdr("FIREWALL (UFW)");
+                    let port_str  = port.to_string();
+                    let range_str = format!("{}:{}/tcp", port, port + 9);
+                    // A UFW rule may be a single port or a range — handle both.
+                    let already_open = text.lines().any(|l| {
+                        if !(l.contains("ALLOW") || l.contains("allow")) { return false; }
+                        let rule = l.split_whitespace().next().unwrap_or("").split('/').next().unwrap_or("");
+                        if rule.contains(':') {
+                            let mut parts = rule.split(':');
+                            let lo: u16 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                            let hi: u16 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                            port >= lo && port <= hi
+                        } else {
+                            rule == port_str
+                        }
+                    });
+                    if already_open {
+                        ok(&format!("UFW: ports {}:{}/tcp are already open.", port, port + 9));
+                    } else {
+                        warn(&format!("UFW is active — ports {}:{} are NOT open.", port, port + 9));
+                        info("The dashboard will bind fine but other devices cannot reach it.");
+                        print!("  Open ports {}:{}/tcp in UFW now? [Y/n]: ", port, port + 9);
+                        std::io::stdout().flush().ok();
+                        let mut ans = String::new();
+                        std::io::stdin().read_line(&mut ans).ok();
+                        if !ans.trim().to_lowercase().starts_with('n') {
+                            let ok2 = std::process::Command::new("sudo")
+                                .args(["ufw", "allow", &range_str])
+                                .status().map(|s| s.success()).unwrap_or(false);
+                            if ok2 {
+                                ok(&format!("Ports {}:{}/tcp opened in UFW.", port, port + 9));
+                            } else {
+                                warn("UFW rule failed — run manually:");
+                                info(&format!("  sudo ufw allow {}", range_str));
+                            }
+                        }
+                    }
+                }
+                // If UFW is inactive or not installed, no action needed.
+            }
         }
         println!();
     }
