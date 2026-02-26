@@ -443,6 +443,159 @@ fn cmd_killall() {
     }
 }
 
+// ─── Linux dependency check ───────────────────────────────────────────────────
+
+/// Map a missing shared-library name to the package that provides it,
+/// per package manager.
+#[cfg(target_os = "linux")]
+fn missing_lib_to_packages(lib: &str) -> (&'static str, &'static str, &'static str) {
+    // (apt/deb package, dnf/rpm package, pacman package)
+    if lib.contains("xdo") {
+        ("xdotool", "xdotool", "xdotool")
+    } else if lib.contains("asound") {
+        ("libasound2", "alsa-lib", "alsa-lib")
+    } else if lib.contains("v4l") {
+        ("libv4l2-0", "libv4l", "v4l-utils")
+    } else if lib.contains("Xtst") {
+        ("libxtst6", "libXtst", "libxtst")
+    } else if lib.contains("Xfixes") {
+        ("libxfixes3", "libXfixes", "libxfixes")
+    } else if lib.contains("Xext") {
+        ("libxext6", "libXext", "libxext")
+    } else if lib.contains("X11") {
+        ("libx11-6", "libX11", "libx11")
+    } else if lib.contains("xcb") {
+        ("libxcb1", "libxcb", "libxcb")
+    } else {
+        ("", "", "")
+    }
+}
+
+/// Run `ldd` against the dashboard binary to find missing shared libraries.
+/// Prints actionable install instructions and returns `false` if unresolved
+/// libs remain so the caller can abort the spawn.
+#[cfg(target_os = "linux")]
+fn linux_check_deps(binary: &PathBuf) -> bool {
+    let out = match std::process::Command::new("ldd")
+        .arg(binary)
+        .stdout(Stdio::piped()).stderr(Stdio::piped())
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return true, // ldd not available — optimistically proceed
+    };
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut missing_apt:    Vec<&'static str> = Vec::new();
+    let mut missing_dnf:    Vec<&'static str> = Vec::new();
+    let mut missing_pacman: Vec<&'static str> = Vec::new();
+
+    for line in text.lines() {
+        if !line.contains("not found") { continue; }
+        // ldd lines look like: "  libxdo.so.3 => not found"
+        let lib = line.split_whitespace().next().unwrap_or("").trim();
+        let (apt, dnf, pac) = missing_lib_to_packages(lib);
+        if !apt.is_empty()    && !missing_apt.contains(&apt)       { missing_apt.push(apt); }
+        if !dnf.is_empty()    && !missing_dnf.contains(&dnf)       { missing_dnf.push(dnf); }
+        if !pac.is_empty()    && !missing_pacman.contains(&pac)     { missing_pacman.push(pac); }
+
+        if apt.is_empty() {
+            // Unknown lib — print the raw name so the user knows what's missing
+            warn(&format!("Missing library: {} (install manually)", lib));
+        }
+    }
+
+    if missing_apt.is_empty() && missing_dnf.is_empty() && missing_pacman.is_empty() {
+        return true; // all deps satisfied
+    }
+
+    err("Dashboard is missing required system libraries:");
+    println!();
+
+    // Try to auto-install with whatever package manager is available
+    let installed_all = if find_bin("apt-get").is_some() {
+        let pkgs: Vec<&str> = missing_apt.iter().map(|s| *s).collect();
+        info(&format!("Installing via apt-get: {}", pkgs.join(" ")));
+        let success = std::process::Command::new("sudo")
+            .args(["apt-get", "install", "-y"])
+            .args(&pkgs)
+            .status().map(|s| s.success()).unwrap_or(false);
+        if success { ok("Dependencies installed."); true }
+        else {
+            warn("Auto-install failed. Run manually:");
+            info(&format!("  sudo apt-get install -y {}", pkgs.join(" ")));
+            false
+        }
+    } else if find_bin("dnf").is_some() {
+        let pkgs: Vec<&str> = missing_dnf.iter().map(|s| *s).collect();
+        info(&format!("Install missing libs with:"));
+        info(&format!("  sudo dnf install -y {}", pkgs.join(" ")));
+        false
+    } else if find_bin("pacman").is_some() {
+        let pkgs: Vec<&str> = missing_pacman.iter().map(|s| *s).collect();
+        info("Install missing libs with:");
+        info(&format!("  sudo pacman -S {}", pkgs.join(" ")));
+        false
+    } else {
+        info("Install the missing libraries using your distro's package manager.");
+        false
+    };
+
+    if installed_all {
+        println!();
+        info("Re-run  andromeda start  to launch the dashboard.");
+        // Even though we installed successfully, return false so cmd_start
+        // doesn't attempt to spawn immediately — a fresh run ensures clean state.
+        false
+    } else {
+        println!();
+        false
+    }
+}
+
+/// Scan the log from `start_offset` for known fatal error patterns and return
+/// a human-readable explanation + fix hint if one is found.
+fn scan_log_for_crash_reason(start_offset: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let path = log_path();
+    let mut file = std::fs::File::open(&path).ok()?;
+    file.seek(SeekFrom::Start(start_offset)).ok()?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).ok()?;
+
+    // Missing shared library (Linux)
+    if let Some(pos) = buf.find("error while loading shared libraries:") {
+        let snippet = &buf[pos..];
+        let line = snippet.lines().next().unwrap_or(snippet);
+        // Extract the library name
+        let lib = line
+            .split(':').nth(1)
+            .and_then(|s| s.split(':').next())
+            .map(|s| s.trim())
+            .unwrap_or("unknown library");
+        return Some(format!(
+            "Missing system library: {}\n  Fix:  sudo apt-get install xdotool libasound2 libv4l2-0 libxtst6",
+            lib
+        ));
+    }
+
+    // Address already in use
+    if buf.contains("AddrInUse") || buf.contains("Address already in use") {
+        return Some(
+            "Port already in use — run  andromeda killall  then try again.".to_string()
+        );
+    }
+
+    // Permission denied
+    if buf.contains("Permission denied") {
+        return Some(
+            "Permission denied — try running with  andromeda start  as your normal user (not root).".to_string()
+        );
+    }
+
+    None
+}
+
 #[cfg(target_os = "windows")]
 fn do_spawn(cmd: &mut std::process::Command) -> Result<std::process::Child> {
     use std::os::windows::process::CommandExt;
@@ -765,7 +918,8 @@ async fn cmd_version(repo: &str) {
 
     match github_latest_tag(repo).await {
         Ok(latest) => {
-            print!("\r");
+            // Overwrite the "checking..." line with spaces then reprint cleanly.
+            print!("\r{}\r", " ".repeat(50));
             info(&format!("Latest release   :  {}", latest));
             if let Some(inst) = &installed {
                 if inst == &latest {
@@ -777,7 +931,7 @@ async fn cmd_version(repo: &str) {
             }
         }
         Err(_) => {
-            print!("\r");
+            print!("\r{}\r", " ".repeat(50));
             warn("Latest release   :  could not reach GitHub");
         }
     }
@@ -957,6 +1111,14 @@ async fn cmd_start(detach: bool) -> Result<()> {
         return Ok(());
     }
 
+    // On Linux, verify all shared-library dependencies are present before
+    // spawning.  If any are missing, print install instructions and abort —
+    // this avoids the confusing 15-second timeout the user would otherwise see.
+    #[cfg(target_os = "linux")]
+    if !linux_check_deps(&binary) {
+        return Ok(());
+    }
+
     // Already running? Stop it first, then start fresh (auto-restart).
     if let Some(pid) = read_pid() {
         if process_alive(pid) {
@@ -993,8 +1155,11 @@ async fn cmd_start(detach: bool) -> Result<()> {
         None => {
             if !process_alive(pid) {
                 err("Dashboard exited during startup.");
-                err("Run `andromeda logs` to see why:");
-                info("  andromeda logs");
+                if let Some(reason) = scan_log_for_crash_reason(log_offset) {
+                    err(&reason);
+                } else {
+                    info("Run  andromeda logs  to see why.");
+                }
                 clear_pid();
             } else {
                 warn("Dashboard didn't report ready within 15 s — may still be starting.");
@@ -1791,6 +1956,17 @@ fn setup_permissions(cfg: &mut Config) -> Result<()> {
                 }
                 warn("Log out and back in (or run 'newgrp video && newgrp audio') for group changes to take effect.");
             }
+        }
+
+        // Check for missing shared libraries (e.g. libxdo.so.3 from enigo).
+        // Do this after group changes so the binary is already in its final state.
+        let binary = cfg.binary();
+        if binary.exists() {
+            hdr("SYSTEM LIBRARIES");
+            if linux_check_deps(&binary) {
+                ok("All required system libraries are present.");
+            }
+            // linux_check_deps already prints instructions if anything is missing.
         }
         println!();
     }
