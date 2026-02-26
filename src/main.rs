@@ -51,14 +51,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Show CLI version, installed dashboard version, and latest available
+    // ── Core lifecycle ────────────────────────────────────────────────────────
+    /// Check for a new andromeda CLI release and update this binary in-place
+    ///
+    /// Detects your platform automatically, downloads the correct binary,
+    /// and replaces the running CLI without any manual steps.
+    SelfUpdate,
+    /// Check installed & latest release versions
     Version {
         #[arg(long, default_value = "Thunder-BluePhoenix/andromeda-releases")]
         repo: String,
     },
-    /// Download the Andromeda dashboard binary from GitHub releases
+    /// First-time setup wizard — permissions, API key, internet access
+    Setup {
+        #[arg(long, default_value = "Thunder-BluePhoenix/andromeda-releases")]
+        repo: String,
+    },
+    /// Download the dashboard binary from GitHub releases
     Install {
-        /// GitHub repository (owner/repo)
         #[arg(long, default_value = "Thunder-BluePhoenix/andromeda-releases")]
         repo: String,
     },
@@ -67,69 +77,115 @@ enum Commands {
         #[arg(long, default_value = "Thunder-BluePhoenix/andromeda-releases")]
         repo: String,
     },
-    /// Start the Andromeda dashboard (follows logs; Ctrl+C stops it)
+
+    // ── Dashboard process ─────────────────────────────────────────────────────
+    /// Start the dashboard  (attached by default — Ctrl+C to stop; use -d to detach)
     Start {
-        /// Detach — start in background without following logs
+        /// Detach: start in background, print URLs, then exit
         #[arg(long, short = 'd')]
         detach: bool,
     },
-    /// Stop the running Andromeda dashboard
+    /// Stop the running dashboard
     Stop,
-    /// Kill ALL running Andromeda dashboard processes on any port
-    Killall,
-    /// Restart the Andromeda dashboard
+    /// Restart the dashboard
     Restart,
-    /// Show dashboard status and access URLs
+    /// Kill ALL andromeda-dashboard processes regardless of port or PID file
+    Killall,
+    /// Show dashboard status, PID, and all access URLs
     Status,
-    /// Open the dashboard in the default web browser
+    /// Open the dashboard in the default browser
     Open,
-    /// View or follow dashboard logs
+
+    // ── Monitoring ────────────────────────────────────────────────────────────
+    /// Follow or show dashboard logs  (-f to stream, -n <lines>)
     Logs {
-        /// Follow log output (like tail -f)
+        /// Stream logs live (like tail -f) — Ctrl+C to stop
         #[arg(long, short = 'f')]
         follow: bool,
-        /// Number of lines to show
+        /// Number of recent lines to show (default 50)
         #[arg(long, short = 'n', default_value = "50")]
         lines: usize,
     },
-    /// Check system health: binary, config, process, ports, and tools
+    /// System health check: binary · config · process · port · firewall · tools
     Doctor,
-    /// API key management (default: show current key)
+
+    // ── API key ───────────────────────────────────────────────────────────────
+    /// API key management — subcommands: show | new | set <KEY>
+    ///
+    /// Examples:
+    ///   andromeda apikey          — show current key
+    ///   andromeda apikey new      — generate a new random key
+    ///   andromeda apikey set abc  — set a specific key
     Apikey {
         #[command(subcommand)]
         action: Option<ApikeyAction>,
     },
-    /// Internet tunnel management
+
+    // ── Internet access ───────────────────────────────────────────────────────
+    /// Show global IPv6 address and direct internet URL (no router config needed)
+    Ipv6,
+    /// Internet tunnel — subcommands: cloudflare | ngrok
+    ///
+    /// Examples:
+    ///   andromeda tunnel cloudflare  — free tunnel, no account required
+    ///   andromeda tunnel ngrok       — instant HTTPS tunnel (ngrok account)
     Tunnel {
         #[command(subcommand)]
         kind: TunnelKind,
     },
-    /// Show IPv6 internet access info
-    Ipv6,
-    /// Show or modify CLI configuration
+    /// Expose a local service to the internet via IPv6 — no router setup needed
+    ///
+    /// Examples:
+    ///   andromeda expose -p 8080                       — expose localhost:8080
+    ///   andromeda expose -p 8080 -u 127.0.0.1:8080    — explicit target
+    ///   andromeda expose -p 9000 -u 192.168.1.5:3000  — forward to another device
+    Expose {
+        /// IPv6 port to listen on (what the outside world connects to)
+        #[arg(long, short = 'p')]
+        port: u16,
+        /// Target to proxy to, e.g. 127.0.0.1:8080 — defaults to 127.0.0.1:<port>
+        #[arg(long, short = 'u')]
+        url: Option<String>,
+        /// Human-readable label
+        #[arg(long, short = 'n', default_value = "")]
+        name: String,
+    },
+    /// List all currently exposed ports and their IPv6 URLs
+    Exposed,
+    /// Stop exposing a port  (andromeda unexpose -p <PORT>)
+    Unexpose {
+        /// Port to stop exposing
+        #[arg(long, short = 'p')]
+        port: u16,
+    },
+
+    // ── Configuration ─────────────────────────────────────────────────────────
+    /// Configuration — subcommands: show | port <N> | binary <PATH>
+    ///
+    /// Examples:
+    ///   andromeda config show         — print all config values
+    ///   andromeda config port 3001    — change dashboard port
+    ///   andromeda config binary /path — set custom binary location
     Config {
         #[command(subcommand)]
         action: ConfigCmd,
     },
-    /// Delete the dashboard binary file only (keeps config and API key)
+
+    // ── Removal ───────────────────────────────────────────────────────────────
+    /// Delete the dashboard binary only — keeps config, API key, and logs
     Purge {
         /// Skip confirmation prompt
         #[arg(long, short = 'y')]
         yes: bool,
     },
-    /// Remove dashboard binary, config, logs, and all Andromeda data
+    /// Remove all Andromeda data: binary, config, logs  (add --with-cli to also remove this CLI)
     Uninstall {
         /// Skip confirmation prompt
         #[arg(long, short = 'y')]
         yes: bool,
-        /// Also remove the andromeda CLI binary itself
+        /// Also delete the andromeda CLI binary itself
         #[arg(long)]
         with_cli: bool,
-    },
-    /// Interactive first-time setup wizard
-    Setup {
-        #[arg(long, default_value = "Thunder-BluePhoenix/andromeda-releases")]
-        repo: String,
     },
 }
 
@@ -750,6 +806,137 @@ fn dashboard_asset_name() -> String {
     } else {
         format!("andromeda-dashboard-{}-{}", os, arch)
     }
+}
+
+/// Asset name for the CLI binary itself (used by self-update).
+fn cli_asset_name() -> String {
+    let os = match std::env::consts::OS {
+        "windows" => "windows",
+        "macos"   => "macos",
+        _         => "linux",
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64"  => "x86_64",
+        "aarch64" => "aarch64",
+        _         => "x86_64",
+    };
+    if cfg!(windows) {
+        format!("andromeda-{}-{}.exe", os, arch)
+    } else {
+        format!("andromeda-{}-{}", os, arch)
+    }
+}
+
+// ─── Command: self-update ─────────────────────────────────────────────────────
+
+async fn cmd_self_update() -> Result<()> {
+    use std::io::Write as _;
+
+    cyan_box("ANDROMEDA CLI — SELF UPDATE");
+
+    let current_ver = concat!("v", env!("CARGO_PKG_VERSION"));
+    let cli_repo    = "Thunder-BluePhoenix/andromeda-cli";
+    let asset_name  = cli_asset_name();
+
+    info(&format!("Current version  :  {}", current_ver));
+    print!("  Checking latest release...  ");
+    std::io::stdout().flush().ok();
+
+    let (latest_tag, download_url) =
+        github_latest_asset(cli_repo, &asset_name).await
+            .context("Could not fetch latest CLI release from GitHub")?;
+
+    // Clear the "Checking..." line
+    print!("\r{}\r", " ".repeat(50));
+    std::io::stdout().flush().ok();
+
+    info(&format!("Latest version   :  {}", latest_tag));
+
+    if latest_tag == current_ver {
+        ok("Already up to date — nothing to do.");
+        return Ok(());
+    }
+
+    println!();
+    print!("  Update CLI  {}  →  {}?  [Y/n]: ", current_ver, latest_tag);
+    std::io::stdout().flush().ok();
+    let mut ans = String::new();
+    std::io::stdin().read_line(&mut ans).ok();
+    if ans.trim().to_lowercase().starts_with('n') {
+        info("Update cancelled.");
+        return Ok(());
+    }
+    println!();
+
+    // Locate the running binary
+    let current_exe = std::env::current_exe()
+        .context("Could not determine current CLI binary path")?
+        .canonicalize()
+        .context("Could not resolve CLI binary path")?;
+
+    // Temp file lives next to the current binary so rename is on the same filesystem
+    let exe_dir  = current_exe.parent().context("CLI binary has no parent directory")?;
+    let tmp_path = exe_dir.join(if cfg!(windows) { "andromeda.tmp.exe" } else { "andromeda.tmp" });
+
+    info(&format!("Downloading  {}  →  tmp", asset_name));
+    download_to(&download_url, &tmp_path).await?;
+
+    // Make executable on Unix
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))
+            .context("Could not chmod new binary")?;
+    }
+
+    // Remove macOS Gatekeeper quarantine flag
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("xattr")
+            .args(["-d", "com.apple.quarantine", &tmp_path.to_string_lossy().into_owned()])
+            .output();
+    }
+
+    // ── Replace the binary ────────────────────────────────────────────────────
+    #[cfg(not(target_os = "windows"))]
+    {
+        // On Unix, rename is atomic and works even while the process is running.
+        std::fs::rename(&tmp_path, &current_exe)
+            .context("Could not replace CLI binary")?;
+        ok(&format!("Updated to {}  —  {}", latest_tag, current_exe.display()));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // On Windows a running binary can be RENAMED but not deleted or overwritten.
+        // Strategy: rename old → .bak, rename new → current, delete .bak via detached cmd.
+        let bak_path = exe_dir.join("andromeda.bak.exe");
+        let _ = std::fs::remove_file(&bak_path); // remove stale bak if any
+
+        std::fs::rename(&current_exe, &bak_path)
+            .context("Could not rename current CLI binary (is another process holding it?)")?;
+        if let Err(e) = std::fs::rename(&tmp_path, &current_exe) {
+            // Roll back: try to restore old binary
+            let _ = std::fs::rename(&bak_path, &current_exe);
+            return Err(e.into());
+        }
+
+        // Delete the .bak file after 2 s via a detached cmd (we can't delete it now)
+        let bak_str = bak_path.to_string_lossy().into_owned();
+        let script  = format!("ping 127.0.0.1 -n 3 >nul & del /F /Q \"{}\"", bak_str);
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        std::process::Command::new("cmd")
+            .args(["/C", &script])
+            .creation_flags(DETACHED_PROCESS)
+            .spawn().ok();
+
+        ok(&format!("Updated to {}  —  {}", latest_tag, current_exe.display()));
+    }
+
+    println!();
+    info("Run  andromeda version  to verify the new version.");
+    Ok(())
 }
 
 async fn github_latest_asset(repo: &str, asset_name: &str) -> Result<(String, String)> {
@@ -1925,6 +2112,108 @@ fn cmd_ipv6() {
     }
 }
 
+// ─── Commands: expose / exposed / unexpose ───────────────────────────────────
+
+/// Build `http://localhost:PORT/api/PATH?api_key=KEY` from the local config.
+fn dashboard_api_url(path: &str) -> (String, reqwest::header::HeaderMap) {
+    let cfg = load_config();
+    let url = format!("http://localhost:{}/api/{}", cfg.port(), path.trim_start_matches('/'));
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "X-API-Key",
+        reqwest::header::HeaderValue::from_str(&cfg.api_key()).unwrap(),
+    );
+    (url, headers)
+}
+
+async fn cmd_expose(port: u16, url: Option<String>, name: String) -> Result<()> {
+    let label  = if name.is_empty() { format!("port-{}", port) } else { name };
+    let target = url.unwrap_or_else(|| format!("127.0.0.1:{}", port));
+
+    let (api_url, headers) = dashboard_api_url("expose");
+    let body = serde_json::json!({ "name": label, "port": port, "target": target });
+
+    hdr("EXPOSE VIA IPv6");
+    let resp = reqwest::Client::new()
+        .post(&api_url)
+        .headers(headers)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Could not reach dashboard: {}", e))?;
+
+    if !resp.status().is_success() {
+        let msg = resp.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!("{}", msg));
+    }
+
+    let info: serde_json::Value = resp.json().await?;
+    ok(&format!("Exposed  [::]:{}  →  {}", port, target));
+    ok(&format!("IPv6 URL: \x1b[36m{}\x1b[0m", info["ipv6_url"].as_str().unwrap_or("")));
+    info_msg("Anyone on the internet can now reach this service via the URL above.");
+    Ok(())
+}
+
+async fn cmd_exposed() -> Result<()> {
+    let (api_url, headers) = dashboard_api_url("expose");
+    let resp = reqwest::Client::new()
+        .get(&api_url)
+        .headers(headers)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Could not reach dashboard: {}", e))?;
+
+    let list: Vec<serde_json::Value> = resp.json().await?;
+    hdr("ACTIVE IPv6 EXPOSURES");
+    if list.is_empty() {
+        info_msg("No ports currently exposed.");
+        info_msg("Use:  andromeda expose -p <PORT> [-u <TARGET>]");
+        return Ok(());
+    }
+
+    // Header row
+    dim("  PORT           TARGET                    IPv6 ACCESS URL");
+    dim("  ─────────────  ────────────────────────  ────────────────────────────────────────");
+
+    for e in &list {
+        let port   = e["port"].as_u64().unwrap_or(0);
+        let target = e["target"].as_str().unwrap_or("?");
+        let ipv6   = e["ipv6_url"].as_str().unwrap_or("?");
+        let name   = e["name"].as_str().unwrap_or("");
+        let port_s = format!("[::]{}", format!(":{}", port));
+        let label  = if name.is_empty() { String::new() }
+                     else { format!("  \x1b[90m({})\x1b[0m", name) };
+        println!("  \x1b[96m{:<13}\x1b[0m  \x1b[37m{:<24}\x1b[0m  \x1b[36m{}\x1b[0m{}",
+            port_s, target, ipv6, label);
+    }
+    println!();
+    info_msg("To stop:  andromeda unexpose -p <PORT>");
+    Ok(())
+}
+
+async fn cmd_unexpose(port: u16) -> Result<()> {
+    let (api_url, headers) = dashboard_api_url(&format!("expose/{}", port));
+    let resp = reqwest::Client::new()
+        .delete(&api_url)
+        .headers(headers)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Could not reach dashboard: {}", e))?;
+
+    if resp.status() == 404 {
+        return Err(anyhow::anyhow!("Port {} is not currently exposed.", port));
+    }
+    if !resp.status().is_success() {
+        return Err(anyhow::anyhow!("HTTP {}", resp.status()));
+    }
+    ok(&format!("Port {} is no longer exposed.", port));
+    Ok(())
+}
+
+// small alias so the functions above can use info_msg without clashing with
+// the `info` helper that already exists in this file
+fn info_msg(s: &str) { info(s); }
+
 // ─── Command: setup ──────────────────────────────────────────────────────────
 
 fn setup_permissions(cfg: &mut Config) -> Result<()> {
@@ -2332,7 +2621,11 @@ async fn main() {
         },
         Commands::Purge     { yes }        => { cmd_purge(yes); Ok(()) }
         Commands::Uninstall { yes, with_cli } => { cmd_uninstall(yes, with_cli); Ok(()) }
+        Commands::SelfUpdate               => cmd_self_update().await,
         Commands::Setup { repo }           => cmd_setup(&repo).await,
+        Commands::Expose { port, url, name } => cmd_expose(port, url, name).await,
+        Commands::Exposed                  => cmd_exposed().await,
+        Commands::Unexpose { port }        => cmd_unexpose(port).await,
     };
 
     if let Err(e) = result {
