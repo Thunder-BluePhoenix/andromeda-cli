@@ -445,7 +445,7 @@ fn kill_pid(pid: u32) -> bool {
 
 /// Kill ALL running andromeda-dashboard processes — including orphans that are
 /// not tracked by the PID file (e.g. left over from `cargo run`, crashes, or
-/// multiple CLI invocations).  Returns the count of PIDs targeted.
+/// multiple CLI invocations).  Returns the count of PIDs actually killed.
 fn kill_all_andromeda() -> u32 {
     let mut killed = 0u32;
 
@@ -468,6 +468,9 @@ fn kill_all_andromeda() -> u32 {
 
     #[cfg(not(target_os = "windows"))]
     {
+        // Exclude our own PID so the CLI never kills itself.
+        let my_pid = std::process::id();
+
         // pgrep -f matches against the full command line, catching any port.
         if let Ok(out) = std::process::Command::new("pgrep")
             .args(["-f", "andromeda-dashboard"])
@@ -475,11 +478,37 @@ fn kill_all_andromeda() -> u32 {
         {
             let pids: Vec<u32> = String::from_utf8_lossy(&out.stdout)
                 .lines()
-                .filter_map(|l| l.trim().parse().ok())
+                .filter_map(|l| l.trim().parse::<u32>().ok())
+                .filter(|&p| p != my_pid)
                 .collect();
-            killed = pids.len() as u32;
-            for pid in pids {
-                kill_pid(pid);
+
+            // Send SIGKILL (-9) — unlike SIGTERM, this cannot be ignored and
+            // works on stopped (Ctrl+Z'd) processes too.
+            for &pid in &pids {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+
+            // Give the OS a moment to reap the processes.
+            if !pids.is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+
+            // Count only PIDs that are actually gone now.
+            for &pid in &pids {
+                let still_alive = std::process::Command::new("kill")
+                    .args(["-0", &pid.to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !still_alive {
+                    killed += 1;
+                }
             }
         }
     }
@@ -774,6 +803,10 @@ fn spawn_bg(binary: &PathBuf, api_key: &str, port: u16, sudo: bool) -> Result<u3
     cmd.env("ANDROMEDA_API_KEY", api_key)
        .env("ANDROMEDA_PORT", port.to_string())
        .env("ANDROMEDA_SUDO", if sudo { "1" } else { "0" })
+       // Suppress verbose ALSA "unable to open slave" / "Unknown PCM" spam on Linux.
+       // These messages come from cpal enumerating audio devices and are harmless
+       // but clutter the dashboard log.
+       .env("ALSA_DEBUG_LEVEL", "0")
        .stdin(Stdio::null())
        .stdout(Stdio::from(log_file))
        .stderr(Stdio::from(err_file));
