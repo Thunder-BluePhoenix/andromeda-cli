@@ -215,6 +215,15 @@ enum ConfigCmd {
     Port { port: u16 },
     /// Set the path to the dashboard binary
     Binary { path: String },
+    /// Set audio/camera backend (Linux only): cap | guard | subprocess | pipewire | off
+    ///
+    /// Examples:
+    ///   andromeda config audio cap        — cap RLIMIT_NOFILE to 1024 (default, safest)
+    ///   andromeda config audio guard      — soft FD check per-call, no hard cap
+    ///   andromeda config audio subprocess — audio in isolated subprocess, unlimited FDs
+    ///   andromeda config audio pipewire   — PipeWire-ALSA bridge, no FD_SETSIZE limit
+    ///   andromeda config audio off        — disable audio and camera entirely
+    Audio { mode: String },
 }
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -228,6 +237,11 @@ struct Config {
     installed_version: Option<String>,
     /// Whether to launch the dashboard with ANDROMEDA_SUDO=1 (admin/elevated mode).
     sudo:              Option<bool>,
+    /// Audio/camera backend mode (Linux only).
+    ///   cap   — cap RLIMIT_NOFILE to 1024 so ALSA never gets a high FD (default, safest)
+    ///   guard — soft FD-count check before each audio call; no hard cap
+    ///   off   — disable audio and camera entirely (good for headless/server use)
+    audio_backend:     Option<String>,
 }
 
 impl Config {
@@ -242,6 +256,9 @@ impl Config {
     }
     fn sudo_mode(&self) -> bool {
         self.sudo.unwrap_or(false)
+    }
+    fn audio_backend(&self) -> &str {
+        self.audio_backend.as_deref().unwrap_or("cap")
     }
 }
 
@@ -782,7 +799,7 @@ fn do_spawn(cmd: &mut std::process::Command) -> Result<std::process::Child> {
     cmd.spawn().context("spawn dashboard")
 }
 
-fn spawn_bg(binary: &PathBuf, api_key: &str, port: u16, sudo: bool) -> Result<u32> {
+fn spawn_bg(binary: &PathBuf, api_key: &str, port: u16, sudo: bool, audio_backend: &str) -> Result<u32> {
     std::fs::create_dir_all(config_dir())?;
 
     // Rotate log if > 10 MB to avoid unbounded growth
@@ -803,6 +820,8 @@ fn spawn_bg(binary: &PathBuf, api_key: &str, port: u16, sudo: bool) -> Result<u3
     cmd.env("ANDROMEDA_API_KEY", api_key)
        .env("ANDROMEDA_PORT", port.to_string())
        .env("ANDROMEDA_SUDO", if sudo { "1" } else { "0" })
+       // Audio/camera backend mode — see `andromeda config audio`.
+       .env("ANDROMEDA_AUDIO_BACKEND", audio_backend)
        // Suppress verbose ALSA "unable to open slave" / "Unknown PCM" spam on Linux.
        // These messages come from cpal enumerating audio devices and are harmless
        // but clutter the dashboard log.
@@ -1362,7 +1381,7 @@ async fn cmd_start(detach: bool) -> Result<()> {
     // Always spawn via background helper (stdout/stderr → log file, PID saved).
     // This ensures `andromeda stop` / `andromeda restart` from another terminal
     // always work regardless of whether we attach to the log or not.
-    let pid = spawn_bg(&binary, &key, port, cfg.sudo_mode())?;
+    let pid = spawn_bg(&binary, &key, port, cfg.sudo_mode(), cfg.audio_backend())?;
     write_pid(pid)?;
     ok(&format!("Dashboard starting (PID {})...", pid));
 
@@ -1773,8 +1792,119 @@ fn cmd_config_show() {
     info(&format!("Port           :  {}", cfg.port()));
     info(&format!("Binary path    :  {}", cfg.binary().display()));
     info(&format!("Installed ver  :  {}", cfg.installed_version.as_deref().unwrap_or("unknown")));
+    info(&format!("Audio backend  :  {}  (Linux only — cap | guard | subprocess | pipewire | off)", cfg.audio_backend()));
+    info(&format!("Admin mode     :  {}", if cfg.sudo_mode() { "enabled" } else { "disabled" }));
     info(&format!("Log file       :  {}", log_path().display()));
     println!();
+}
+
+// ─── Linux package helpers ────────────────────────────────────────────────────
+
+/// Check if PipeWire is installed (pw-cli present in PATH).
+#[cfg(target_os = "linux")]
+fn pipewire_installed() -> bool {
+    std::process::Command::new("which")
+        .arg("pw-cli")
+        .stdout(Stdio::null()).stderr(Stdio::null())
+        .status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// Check if apt-get is available (Debian/Ubuntu systems).
+#[cfg(target_os = "linux")]
+fn has_apt() -> bool {
+    std::process::Command::new("which")
+        .arg("apt-get")
+        .stdout(Stdio::null()).stderr(Stdio::null())
+        .status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// Offer to install PipeWire packages via apt-get.
+/// Returns true if PipeWire is available after the call.
+#[cfg(target_os = "linux")]
+fn ensure_pipewire() -> bool {
+    use std::io::Write;
+
+    if pipewire_installed() {
+        ok("PipeWire detected — ready.");
+        return true;
+    }
+
+    warn("PipeWire not found on this system.");
+    // pipewire-jack provides the JACK compatibility layer used by the dashboard's
+    // PipeWire-native cpal host (cpal::HostId::Jack → PipeWire via pipewire-jack).
+    println!("  Required packages: pipewire  pipewire-alsa  pipewire-jack  wireplumber");
+    println!();
+
+    if has_apt() {
+        print!("  Install now? (sudo apt-get install -y pipewire pipewire-alsa pipewire-jack wireplumber) [Y/n]: ");
+        let _ = std::io::stdout().flush();
+        let mut ans = String::new();
+        let _ = std::io::stdin().read_line(&mut ans);
+        if ans.trim().to_lowercase().starts_with('n') {
+            warn("Skipped. Install manually before using pipewire mode.");
+            return false;
+        }
+        let ok_install = std::process::Command::new("sudo")
+            .args(["apt-get", "install", "-y", "pipewire", "pipewire-alsa", "pipewire-jack", "wireplumber"])
+            .status().map(|s| s.success()).unwrap_or(false);
+        if ok_install {
+            ok("PipeWire installed successfully.");
+            info("Run 'systemctl --user enable --now wireplumber pipewire pipewire-pulse' to start it.");
+            return true;
+        } else {
+            err("Install failed. Run manually:");
+            info("  sudo apt-get install -y pipewire pipewire-alsa pipewire-jack wireplumber");
+            return false;
+        }
+    } else {
+        warn("apt-get not found — install PipeWire manually for your distro:");
+        info("  Fedora / RHEL : sudo dnf install pipewire pipewire-alsa pipewire-jack wireplumber");
+        info("  Arch          : sudo pacman -S pipewire pipewire-alsa pipewire-jack wireplumber");
+        info("  openSUSE      : sudo zypper install pipewire pipewire-alsa pipewire-jack wireplumber");
+        false
+    }
+}
+
+fn cmd_config_set_audio(mode: &str) {
+    const VALID: &[&str] = &["cap", "guard", "subprocess", "pipewire", "off"];
+
+    if !VALID.contains(&mode) {
+        err(&format!("Unknown audio mode '{}'. Valid: {}", mode, VALID.join(" | ")));
+        println!();
+        info("  cap        — cap RLIMIT_NOFILE to 1024, ALSA always safe       (default)");
+        info("  guard      — soft FD check per-call, no hard cap");
+        info("  subprocess — audio in an isolated subprocess, unlimited FDs    (Linux)");
+        info("  pipewire   — PipeWire-ALSA bridge, no FD_SETSIZE limit         (Linux)");
+        info("  off        — disable audio and camera entirely");
+        return;
+    }
+
+    // PipeWire mode: check/install required system packages first.
+    #[cfg(target_os = "linux")]
+    if mode == "pipewire" && !ensure_pipewire() {
+        warn("PipeWire not available — mode not saved. Install PipeWire first.");
+        return;
+    }
+
+    let mut cfg = load_config();
+    cfg.audio_backend = Some(mode.to_string());
+    match save_config(&cfg) {
+        Ok(_) => {
+            ok(&format!("Audio backend set to: {}", mode));
+            match mode {
+                "cap"        => info("Dashboard will cap RLIMIT_NOFILE to 1024 — ALSA always safe."),
+                "guard"      => info("Dashboard will check FD count before each audio call."),
+                "subprocess" => info("Audio/camera will run in an isolated subprocess — unlimited connections."),
+                "pipewire"   => info("Audio routed through PipeWire-ALSA bridge — no FD_SETSIZE limit."),
+                "off"        => info("Audio and camera endpoints will be disabled."),
+                _ => {}
+            }
+            if read_pid().map(process_alive).unwrap_or(false) {
+                warn("Dashboard running — run 'andromeda restart' to apply.");
+            }
+        }
+        Err(e) => err(&format!("Save failed: {}", e)),
+    }
 }
 
 fn cmd_config_set_port(port: u16) {
@@ -2553,13 +2683,67 @@ async fn cmd_setup(repo: &str) -> Result<()> {
         _ => {}
     }
 
-    // ── Step 4: Permissions ──────────────────────────────────────────────────
-    hdr("STEP 4 — PERMISSIONS");
+    // ── Step 4: Audio backend (Linux only) ───────────────────────────────────
+    #[cfg(target_os = "linux")]
+    {
+        hdr("STEP 4 — AUDIO / CAMERA BACKEND");
+        println!("  ALSA can crash the dashboard when too many connections are open");
+        println!("  (FD numbers exceed the select() hard limit of 1024).");
+        println!("  Choose how to handle this:");
+        println!();
+
+        // Detect what is already available on this system.
+        let pw_ok = pipewire_installed();
+        let pw_tag = if pw_ok { " [installed]" } else { " [not installed — can install now]" };
+
+        println!("  1) cap        — Safest. Cap RLIMIT_NOFILE to 1024 so ALSA never");
+        println!("                  gets a high FD. Up to ~1009 concurrent connections.");
+        println!("                  Recommended for most desktop/laptop setups.  [default]");
+        println!();
+        println!("  2) subprocess — Audio captured in an isolated child process.");
+        println!("                  Main dashboard has unlimited FDs and can't crash.");
+        println!("                  No extra packages needed.");
+        println!();
+        println!("  3) pipewire   — Route ALSA through the PipeWire bridge.{}", pw_tag);
+        println!("                  PipeWire uses epoll, not select() — no FD_SETSIZE limit.");
+        println!("                  Unlimited connections, full audio quality.");
+        println!();
+        println!("  4) guard      — Soft check per audio/camera call. Skips audio when");
+        println!("                  FDs are high. No connection limit but may skip audio.");
+        println!();
+        println!("  5) off        — Disable audio and camera entirely.");
+        println!("                  Best for headless servers with no microphone/webcam.");
+        println!();
+        print!("  Choice [1]: ");
+        std::io::stdout().flush()?;
+        let mut ans = String::new();
+        std::io::stdin().read_line(&mut ans)?;
+
+        let audio_mode: &str = match ans.trim() {
+            "2" => "subprocess",
+            "3" => {
+                // PipeWire: install packages if not present.
+                if !pw_ok {
+                    ensure_pipewire();
+                }
+                "pipewire"
+            }
+            "4" => "guard",
+            "5" => "off",
+            _   => "cap",
+        };
+        cfg.audio_backend = Some(audio_mode.to_string());
+        save_config(&cfg)?;
+        ok(&format!("Audio backend set to: {}", audio_mode));
+    }
+
+    // ── Step 5: Permissions ──────────────────────────────────────────────────
+    hdr("STEP 5 — PERMISSIONS");
     setup_permissions(&mut cfg)?;
     save_config(&cfg)?;
 
-    // ── Step 5: Start now? ───────────────────────────────────────────────────
-    hdr("STEP 5 — START");
+    // ── Step 6: Start now? ───────────────────────────────────────────────────
+    hdr("STEP 6 — START");
     print!("  Start the dashboard now? [Y/n]: ");
     std::io::stdout().flush()?;
     let mut ans = String::new();
@@ -2648,9 +2832,10 @@ async fn main() {
         },
         Commands::Ipv6                     => { cmd_ipv6(); Ok(()) }
         Commands::Config  { action }       => match action {
-            ConfigCmd::Show         => { cmd_config_show(); Ok(()) }
+            ConfigCmd::Show             => { cmd_config_show(); Ok(()) }
             ConfigCmd::Port { port }    => { cmd_config_set_port(port); Ok(()) }
             ConfigCmd::Binary { path }  => { cmd_config_set_binary(&path); Ok(()) }
+            ConfigCmd::Audio { mode }   => { cmd_config_set_audio(&mode); Ok(()) }
         },
         Commands::Purge     { yes }        => { cmd_purge(yes); Ok(()) }
         Commands::Uninstall { yes, with_cli } => { cmd_uninstall(yes, with_cli); Ok(()) }
