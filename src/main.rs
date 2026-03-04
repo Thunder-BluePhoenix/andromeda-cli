@@ -224,6 +224,12 @@ enum ConfigCmd {
     ///   andromeda config audio pipewire   — PipeWire-ALSA bridge, no FD_SETSIZE limit
     ///   andromeda config audio off        — disable audio and camera entirely
     Audio { mode: String },
+    /// Set screen capture backend (Linux only): xcb | xlib
+    ///
+    /// Examples:
+    ///   andromeda config screen xcb   — pure-Rust XCB protocol, FD-safe (default)
+    ///   andromeda config screen xlib  — legacy Xlib via screenshots crate
+    Screen { mode: String },
 }
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -242,6 +248,10 @@ struct Config {
     ///   guard — soft FD-count check before each audio call; no hard cap
     ///   off   — disable audio and camera entirely (good for headless/server use)
     audio_backend:     Option<String>,
+    /// Screen capture backend (Linux only).
+    ///   xcb   — pure-Rust XCB protocol (x11rb); no select(), FD-safe (default)
+    ///   xlib  — Xlib via screenshots crate; needs subprocess isolation
+    screen_backend:    Option<String>,
 }
 
 impl Config {
@@ -259,6 +269,9 @@ impl Config {
     }
     fn audio_backend(&self) -> &str {
         self.audio_backend.as_deref().unwrap_or("cap")
+    }
+    fn screen_backend(&self) -> &str {
+        self.screen_backend.as_deref().unwrap_or("xcb")
     }
 }
 
@@ -799,7 +812,7 @@ fn do_spawn(cmd: &mut std::process::Command) -> Result<std::process::Child> {
     cmd.spawn().context("spawn dashboard")
 }
 
-fn spawn_bg(binary: &PathBuf, api_key: &str, port: u16, sudo: bool, audio_backend: &str) -> Result<u32> {
+fn spawn_bg(binary: &PathBuf, api_key: &str, port: u16, sudo: bool, audio_backend: &str, screen_backend: &str) -> Result<u32> {
     std::fs::create_dir_all(config_dir())?;
 
     // Rotate log if > 10 MB to avoid unbounded growth
@@ -822,6 +835,8 @@ fn spawn_bg(binary: &PathBuf, api_key: &str, port: u16, sudo: bool, audio_backen
        .env("ANDROMEDA_SUDO", if sudo { "1" } else { "0" })
        // Audio/camera backend mode — see `andromeda config audio`.
        .env("ANDROMEDA_AUDIO_BACKEND", audio_backend)
+       // Screen capture backend — see `andromeda config screen` (Linux only).
+       .env("ANDROMEDA_SCREEN_BACKEND", screen_backend)
        // Suppress verbose ALSA "unable to open slave" / "Unknown PCM" spam on Linux.
        // These messages come from cpal enumerating audio devices and are harmless
        // but clutter the dashboard log.
@@ -1381,7 +1396,7 @@ async fn cmd_start(detach: bool) -> Result<()> {
     // Always spawn via background helper (stdout/stderr → log file, PID saved).
     // This ensures `andromeda stop` / `andromeda restart` from another terminal
     // always work regardless of whether we attach to the log or not.
-    let pid = spawn_bg(&binary, &key, port, cfg.sudo_mode(), cfg.audio_backend())?;
+    let pid = spawn_bg(&binary, &key, port, cfg.sudo_mode(), cfg.audio_backend(), cfg.screen_backend())?;
     write_pid(pid)?;
     ok(&format!("Dashboard starting (PID {})...", pid));
 
@@ -1897,6 +1912,38 @@ fn cmd_config_set_audio(mode: &str) {
                 "subprocess" => info("Audio/camera will run in an isolated subprocess — unlimited connections."),
                 "pipewire"   => info("Audio routed through PipeWire-ALSA bridge — no FD_SETSIZE limit."),
                 "off"        => info("Audio and camera endpoints will be disabled."),
+                _ => {}
+            }
+            if read_pid().map(process_alive).unwrap_or(false) {
+                warn("Dashboard running — run 'andromeda restart' to apply.");
+            }
+        }
+        Err(e) => err(&format!("Save failed: {}", e)),
+    }
+}
+
+fn cmd_config_set_screen(mode: &str) {
+    const VALID: &[&str] = &["xcb", "xlib"];
+
+    if !VALID.contains(&mode) {
+        err(&format!("Unknown screen backend '{}'. Valid: xcb | xlib", mode));
+        println!();
+        info("  xcb  — Pure-Rust XCB protocol (x11rb), no select(), FD-safe  (default, Linux)");
+        info("  xlib — Legacy Xlib via screenshots crate; subprocess-isolated (Linux)");
+        return;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    warn("Screen backend selection is Linux-only — config saved but has no effect here.");
+
+    let mut cfg = load_config();
+    cfg.screen_backend = Some(mode.to_string());
+    match save_config(&cfg) {
+        Ok(_) => {
+            ok(&format!("Screen backend set to: {}", mode));
+            match mode {
+                "xcb"  => info("Dashboard will use x11rb (XCB) for screen capture — FD-safe at any FD count."),
+                "xlib" => info("Dashboard will use screenshots crate (Xlib) — subprocess-isolated."),
                 _ => {}
             }
             if read_pid().map(process_alive).unwrap_or(false) {
@@ -2737,13 +2784,42 @@ async fn cmd_setup(repo: &str) -> Result<()> {
         ok(&format!("Audio backend set to: {}", audio_mode));
     }
 
-    // ── Step 5: Permissions ──────────────────────────────────────────────────
-    hdr("STEP 5 — PERMISSIONS");
+    // ── Step 5: Screen capture backend (Linux only) ──────────────────────────
+    #[cfg(target_os = "linux")]
+    {
+        hdr("STEP 5 — SCREEN CAPTURE BACKEND");
+        println!("  Choose how Andromeda captures the screen (MJPEG stream, WebRTC video,");
+        println!("  and screen snapshots).");
+        println!();
+        println!("  1) xcb   (recommended) — Pure-Rust XCB protocol (x11rb).");
+        println!("                           No select() call — FD-safe at any FD count.");
+        println!("                           Works directly in the main process.  [default]");
+        println!();
+        println!("  2) xlib  (legacy)      — Xlib via screenshots crate.");
+        println!("                           Needs subprocess isolation to avoid FD_SETSIZE");
+        println!("                           crash (same pattern as audio subprocess mode).");
+        println!();
+        print!("  Choice [1]: ");
+        std::io::stdout().flush()?;
+        let mut ans = String::new();
+        std::io::stdin().read_line(&mut ans)?;
+
+        let screen_mode: &str = match ans.trim() {
+            "2" => "xlib",
+            _   => "xcb",
+        };
+        cfg.screen_backend = Some(screen_mode.to_string());
+        save_config(&cfg)?;
+        ok(&format!("Screen backend set to: {}", screen_mode));
+    }
+
+    // ── Step 6: Permissions ──────────────────────────────────────────────────
+    hdr("STEP 6 — PERMISSIONS");
     setup_permissions(&mut cfg)?;
     save_config(&cfg)?;
 
-    // ── Step 6: Start now? ───────────────────────────────────────────────────
-    hdr("STEP 6 — START");
+    // ── Step 7: Start now? ───────────────────────────────────────────────────
+    hdr("STEP 7 — START");
     print!("  Start the dashboard now? [Y/n]: ");
     std::io::stdout().flush()?;
     let mut ans = String::new();
@@ -2835,7 +2911,8 @@ async fn main() {
             ConfigCmd::Show             => { cmd_config_show(); Ok(()) }
             ConfigCmd::Port { port }    => { cmd_config_set_port(port); Ok(()) }
             ConfigCmd::Binary { path }  => { cmd_config_set_binary(&path); Ok(()) }
-            ConfigCmd::Audio { mode }   => { cmd_config_set_audio(&mode); Ok(()) }
+            ConfigCmd::Audio  { mode }  => { cmd_config_set_audio(&mode);  Ok(()) }
+            ConfigCmd::Screen { mode }  => { cmd_config_set_screen(&mode); Ok(()) }
         },
         Commands::Purge     { yes }        => { cmd_purge(yes); Ok(()) }
         Commands::Uninstall { yes, with_cli } => { cmd_uninstall(yes, with_cli); Ok(()) }
