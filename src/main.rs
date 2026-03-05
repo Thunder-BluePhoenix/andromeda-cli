@@ -624,11 +624,12 @@ fn linux_check_deps(binary: &PathBuf) -> bool {
         // ldd lines look like: "  libxdo.so.3 => not found"
         let lib = line.split_whitespace().next().unwrap_or("").trim();
         let (apt, dnf, pac) = missing_lib_to_packages(lib);
-        if !apt.is_empty()    && !missing_apt.contains(&apt)       { missing_apt.push(apt); }
-        if !dnf.is_empty()    && !missing_dnf.contains(&dnf)       { missing_dnf.push(dnf); }
-        if !pac.is_empty()    && !missing_pacman.contains(&pac)     { missing_pacman.push(pac); }
+        let apt_known = !apt.is_empty();
+        if apt_known              && !missing_apt.contains(&apt)    { missing_apt.push(apt); }
+        if !dnf.is_empty()        && !missing_dnf.contains(&dnf)    { missing_dnf.push(dnf); }
+        if !pac.is_empty()        && !missing_pacman.contains(&pac) { missing_pacman.push(pac); }
 
-        if apt.is_empty() {
+        if !apt_known {
             // Unknown lib — print the raw name so the user knows what's missing
             warn(&format!("Missing library: {} (install manually)", lib));
         }
