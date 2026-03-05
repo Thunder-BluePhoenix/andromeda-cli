@@ -1884,6 +1884,19 @@ async fn cmd_doctor() {
         Some(p) => ok(&format!("ngrok            : {}", p)),
         None    => info("ngrok            : not installed (optional)"),
     }
+    // Linux: grim for Wayland screen capture
+    #[cfg(target_os = "linux")]
+    {
+        let session = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
+        let wayland = session == "wayland"
+            || std::env::var("WAYLAND_DISPLAY").is_ok();
+        if wayland {
+            match find_bin("grim") {
+                Some(p) => ok(&format!("grim             : {}  (Wayland screen capture)", p)),
+                None    => warn("grim             : not installed — screen capture will be black on Wayland!\n             Fix:  sudo apt install grim"),
+            }
+        }
+    }
 
     // Linux: UFW firewall check
     // The dashboard tries ports base..base+9 so check if the active port (or its
@@ -2949,17 +2962,53 @@ async fn cmd_setup(repo: &str) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         hdr("STEP 5 — SCREEN CAPTURE BACKEND");
+
+        // Detect Wayland early so we can show the right advice.
+        let running_wayland = std::env::var("XDG_SESSION_TYPE").map(|v| v == "wayland").unwrap_or(false)
+            || std::env::var("WAYLAND_DISPLAY").is_ok();
+
         println!("  Choose how Andromeda captures the screen (MJPEG stream, WebRTC video,");
         println!("  and screen snapshots).");
         println!();
         println!("  1) xcb   (recommended) — Pure-Rust XCB protocol (x11rb).");
         println!("                           No select() call — FD-safe at any FD count.");
-        println!("                           Works directly in the main process.  [default]");
+        if running_wayland {
+            println!("                           On Wayland: auto-uses grim if installed.");
+        } else {
+            println!("                           Works directly in the main process.  [default]");
+        }
         println!();
         println!("  2) xlib  (legacy)      — Xlib via screenshots crate.");
         println!("                           Needs subprocess isolation to avoid FD_SETSIZE");
         println!("                           crash (same pattern as audio subprocess mode).");
         println!();
+
+        // Wayland: check if grim is installed, offer to install it.
+        if running_wayland {
+            println!("  \x1b[33m[!]\x1b[0m Wayland session detected.");
+            if find_bin("grim").is_some() {
+                println!("  \x1b[32m[+]\x1b[0m grim is installed — Wayland screen capture is ready.");
+            } else {
+                println!("  \x1b[31m[x]\x1b[0m grim not found — screen capture will be black on Wayland.");
+                println!("      grim is a lightweight Wayland screenshot tool (no daemon needed).");
+                print!("  Install grim now? (sudo apt install grim) [Y/n]: ");
+                std::io::stdout().flush()?;
+                let mut yn = String::new();
+                std::io::stdin().read_line(&mut yn)?;
+                if !yn.trim().to_lowercase().starts_with('n') {
+                    let installed = std::process::Command::new("sudo")
+                        .args(["apt-get", "install", "-y", "grim"])
+                        .status().map(|s| s.success()).unwrap_or(false);
+                    if installed {
+                        ok("grim installed — Wayland screen capture is now ready.");
+                    } else {
+                        warn("grim install failed. Run manually: sudo apt install grim");
+                    }
+                }
+            }
+            println!();
+        }
+
         print!("  Choice [1]: ");
         std::io::stdout().flush()?;
         let mut ans = String::new();

@@ -223,7 +223,7 @@ andromeda config audio off
 
 ## 5. Screen Capture Backends (Linux)
 
-The `screenshots` crate (used for MJPEG stream, screen snapshots, and WebRTC video) is built on Xlib, which also calls `select()`. The `screen_backend` setting lets you switch to the XCB protocol instead, which is FD-safe at any FD number.
+The `screen_backend` setting controls how the screen is captured for the MJPEG stream, screen snapshots, and WebRTC video.
 
 Set with:
 
@@ -232,15 +232,29 @@ andromeda config screen <mode>
 andromeda restart
 ```
 
+### Wayland Note (Ubuntu 22.04+, Ubuntu 24.04)
+
+Ubuntu 22.04+ uses GNOME with Wayland by default. XCB's `GetImage` call returns a black frame on Wayland because the Wayland compositor does not expose its framebuffer through XWayland.
+
+**Fix**: install `grim`, a lightweight Wayland screenshot tool:
+
+```bash
+sudo apt install grim
+```
+
+The dashboard auto-detects Wayland (`WAYLAND_DISPLAY` or `XDG_SESSION_TYPE=wayland`) and uses `grim` automatically when it is installed. No config change needed. The setup wizard (Step 5) also detects Wayland and offers to install `grim` for you.
+
+`grim` works on any Wayland compositor that supports `zwlr-screencopy`, or via `xdg-desktop-portal` (which covers GNOME 42+, i.e. Ubuntu 22.04 and later).
+
 ### Modes
 
 #### `xcb` *(default, recommended)*
 
-Uses `x11rb` — a pure-Rust XCB protocol client. Communicates with the X server directly over a Unix socket without ever calling `select()`. Safe regardless of how many FDs are open.
+Uses `x11rb` (pure-Rust XCB protocol client). On X11: connects directly to the X server and captures the root window. On Wayland: automatically delegates to `grim` if installed.
 
 - **Pros**: FD-safe at any FD count; no C library dependencies; works in the main process.
-- **Cons**: Requires an X11 display (`DISPLAY` env var must be set).
-- **Best for**: All Linux users with X11 (this is the default).
+- **On Wayland**: requires `grim` installed (`sudo apt install grim`).
+- **Best for**: All Linux users — handles both X11 and Wayland automatically.
 
 ```bash
 andromeda config screen xcb
@@ -250,9 +264,9 @@ andromeda config screen xcb
 
 Uses the `screenshots` crate (Xlib). Spawns a subprocess for isolation to avoid the FD_SETSIZE crash.
 
-- **Pros**: Widest compatibility (same code as Windows/macOS).
-- **Cons**: Subprocess overhead; FD-unsafe if run directly.
-- **Best for**: Fallback only — use xcb unless you have a specific reason.
+- **Pros**: Widest compatibility.
+- **Cons**: Subprocess overhead; also broken on Wayland (same black-screen issue).
+- **Best for**: Fallback only.
 
 ```bash
 andromeda config screen xlib
@@ -260,12 +274,12 @@ andromeda config screen xlib
 
 ### Comparison
 
-| Mode | FD-Safe | Subprocess | C Dependency | Notes |
-|------|---------|------------|--------------|-------|
-| `xcb` | Yes | No (MJPEG); Yes (WebRTC) | None | Default; pure Rust |
-| `xlib` | No (direct) | Yes | Xlib | Legacy; subprocess mitigates crash |
+| Mode | X11 | Wayland | FD-Safe | Subprocess |
+|------|-----|---------|---------|------------|
+| `xcb` | Yes | Yes (needs `grim`) | Yes | No (MJPEG); Yes (WebRTC) |
+| `xlib` | Yes | No (black screen) | No (direct) | Yes |
 
-> **Note on WebRTC**: Both modes use a subprocess for WebRTC screen sharing (consistent with the audio/camera WebRTC architecture). The `ANDROMEDA_SCREEN_BACKEND` env var is inherited by the subprocess, so `xcb` mode stays FD-safe end-to-end.
+> **Note on WebRTC**: Both modes use a subprocess for WebRTC screen sharing. `ANDROMEDA_SCREEN_BACKEND` is inherited by the subprocess, so Wayland + `grim` works end-to-end.
 
 ---
 
