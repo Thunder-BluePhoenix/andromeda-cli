@@ -561,28 +561,42 @@ fn cmd_killall() {
 // ─── Linux dependency check ───────────────────────────────────────────────────
 
 /// Map a missing shared-library name to the package that provides it,
-/// per package manager.
+/// per package manager.  Returns (apt, dnf, pacman) package names.
 #[cfg(target_os = "linux")]
-fn missing_lib_to_packages(lib: &str) -> (&'static str, &'static str, &'static str) {
-    // (apt/deb package, dnf/rpm package, pacman package)
+fn missing_lib_to_packages(lib: &str) -> (String, String, String) {
+    let s = |s: &'static str| s.to_string();
     if lib.contains("xdo") {
-        ("xdotool", "xdotool", "xdotool")
+        (s("xdotool"), s("xdotool"), s("xdotool"))
     } else if lib.contains("asound") {
-        ("libasound2", "alsa-lib", "alsa-lib")
+        (s("libasound2"), s("alsa-lib"), s("alsa-lib"))
     } else if lib.contains("v4l") {
-        ("libv4l2-0", "libv4l", "v4l-utils")
+        (s("libv4l2-0"), s("libv4l"), s("v4l-utils"))
     } else if lib.contains("Xtst") {
-        ("libxtst6", "libXtst", "libxtst")
+        (s("libxtst6"), s("libXtst"), s("libxtst"))
     } else if lib.contains("Xfixes") {
-        ("libxfixes3", "libXfixes", "libxfixes")
+        (s("libxfixes3"), s("libXfixes"), s("libxfixes"))
     } else if lib.contains("Xext") {
-        ("libxext6", "libXext", "libxext")
+        (s("libxext6"), s("libXext"), s("libxext"))
     } else if lib.contains("X11") {
-        ("libx11-6", "libX11", "libx11")
+        (s("libx11-6"), s("libX11"), s("libx11"))
     } else if lib.contains("xcb") {
-        ("libxcb1", "libxcb", "libxcb")
+        (s("libxcb1"), s("libxcb"), s("libxcb"))
+    } else if lib.contains("vpx") {
+        // ldd reports the SONAME: "libvpx.so.7", "libvpx.so.9", etc.
+        // apt package matches the major version: libvpx7, libvpx9, …
+        let ver = lib.rsplitn(2, '.').next().unwrap_or("7");
+        let apt = if ver.parse::<u32>().is_ok() {
+            format!("libvpx{}", ver)
+        } else {
+            "libvpx7".to_string() // fallback if SONAME has unexpected format
+        };
+        (apt, s("libvpx"), s("libvpx"))
+    } else if lib.contains("opus") {
+        (s("libopus0"), s("opus"), s("opus"))
+    } else if lib.contains("jack") {
+        (s("libjack-jackd2-0"), s("jack-audio-connection-kit-libs"), s("jack2"))
     } else {
-        ("", "", "")
+        (s(""), s(""), s(""))
     }
 }
 
@@ -601,9 +615,9 @@ fn linux_check_deps(binary: &PathBuf) -> bool {
     };
 
     let text = String::from_utf8_lossy(&out.stdout);
-    let mut missing_apt:    Vec<&'static str> = Vec::new();
-    let mut missing_dnf:    Vec<&'static str> = Vec::new();
-    let mut missing_pacman: Vec<&'static str> = Vec::new();
+    let mut missing_apt:    Vec<String> = Vec::new();
+    let mut missing_dnf:    Vec<String> = Vec::new();
+    let mut missing_pacman: Vec<String> = Vec::new();
 
     for line in text.lines() {
         if !line.contains("not found") { continue; }
@@ -629,7 +643,7 @@ fn linux_check_deps(binary: &PathBuf) -> bool {
 
     // Try to auto-install with whatever package manager is available
     let installed_all = if find_bin("apt-get").is_some() {
-        let pkgs: Vec<&str> = missing_apt.iter().map(|s| *s).collect();
+        let pkgs: Vec<&str> = missing_apt.iter().map(|s| s.as_str()).collect();
         info(&format!("Installing via apt-get: {}", pkgs.join(" ")));
         let success = std::process::Command::new("sudo")
             .args(["apt-get", "install", "-y"])
@@ -642,12 +656,12 @@ fn linux_check_deps(binary: &PathBuf) -> bool {
             false
         }
     } else if find_bin("dnf").is_some() {
-        let pkgs: Vec<&str> = missing_dnf.iter().map(|s| *s).collect();
+        let pkgs: Vec<&str> = missing_dnf.iter().map(|s| s.as_str()).collect();
         info(&format!("Install missing libs with:"));
         info(&format!("  sudo dnf install -y {}", pkgs.join(" ")));
         false
     } else if find_bin("pacman").is_some() {
-        let pkgs: Vec<&str> = missing_pacman.iter().map(|s| *s).collect();
+        let pkgs: Vec<&str> = missing_pacman.iter().map(|s| s.as_str()).collect();
         info("Install missing libs with:");
         info(&format!("  sudo pacman -S {}", pkgs.join(" ")));
         false
@@ -689,7 +703,7 @@ fn scan_log_for_crash_reason(start_offset: u64) -> Option<String> {
             .map(|s| s.trim())
             .unwrap_or("unknown library");
         return Some(format!(
-            "Missing system library: {}\n  Fix:  sudo apt-get install xdotool libasound2 libv4l2-0 libxtst6",
+            "Missing system library: {}\n  Fix:  sudo apt-get install xdotool libasound2 libv4l2-0 libxtst6 libvpx7 libopus0 libjack-jackd2-0",
             lib
         ));
     }
