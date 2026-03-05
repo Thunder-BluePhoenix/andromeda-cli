@@ -560,6 +560,92 @@ fn cmd_killall() {
 
 // ─── Linux dependency check ───────────────────────────────────────────────────
 
+/// When a library SONAME (e.g. "libvpx.so.7") is missing but a *higher*
+/// ABI version of the same library is installed (e.g. libvpx.so.9), create a
+/// compatibility symlink so the binary can load it.  This handles the common
+/// case of a binary built on Ubuntu 22.04 (libvpxN) running on Ubuntu 24.04
+/// (libvpxN+2) where the newer package isn't in the 24.04 repos.
+/// Returns true if the symlink was created (or already existed) successfully.
+#[cfg(target_os = "linux")]
+fn try_soname_compat_symlink(soname: &str) -> bool {
+    // Parse "libvpx.so.7" → base="libvpx.so.", needed_ver=7
+    let dot_so = ".so.";
+    let so_idx = match soname.find(dot_so) {
+        Some(i) => i,
+        None    => return false,
+    };
+    let base    = &soname[..so_idx];                   // "libvpx"
+    let ver_str = &soname[so_idx + dot_so.len()..];    // "7"
+    let needed: u32 = match ver_str.parse() {
+        Ok(v)  => v,
+        Err(_) => return false,
+    };
+
+    // Ask ldconfig for all installed sonames.
+    let out = match std::process::Command::new("ldconfig").arg("-p").output() {
+        Ok(o)  => o,
+        Err(_) => return false,
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+
+    // Find the highest installed version strictly greater than needed.
+    // ldconfig -p line format:  "	libvpx.so.9 (libc6,x86-64) => /usr/lib/x86_64-linux-gnu/libvpx.so.9"
+    let prefix = format!("{}.so.", base);
+    let mut best: Option<(u32, String)> = None;
+    for line in text.lines() {
+        if !line.contains(&prefix) { continue; }
+        let after = match line.find(&prefix) {
+            Some(i) => &line[i + prefix.len()..],
+            None    => continue,
+        };
+        let ver_part: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let installed_ver: u32 = match ver_part.parse() {
+            Ok(v)  => v,
+            Err(_) => continue,
+        };
+        if installed_ver <= needed { continue; }
+        let path = match line.find("=> ") {
+            Some(p) => line[p + 3..].trim().to_string(),
+            None    => continue,
+        };
+        if best.as_ref().map(|(v, _)| installed_ver > *v).unwrap_or(true) {
+            best = Some((installed_ver, path));
+        }
+    }
+
+    let (found_ver, src_path) = match best {
+        Some(b) => b,
+        None    => return false,
+    };
+    let dir = match std::path::Path::new(&src_path).parent() {
+        Some(d) => d,
+        None    => return false,
+    };
+    let symlink_path = dir.join(soname);
+
+    // Already exists?
+    if symlink_path.exists() { return true; }
+
+    info(&format!(
+        "Found {}.so.{} — creating compat symlink {} → {} …",
+        base, found_ver, soname, src_path
+    ));
+    let success = std::process::Command::new("sudo")
+        .args(["ln", "-sf", &src_path, &symlink_path.to_string_lossy().into_owned()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if success {
+        ok(&format!("Symlink created: {} → {}", symlink_path.display(), src_path));
+        true
+    } else {
+        warn("Could not create symlink automatically. Run:");
+        info(&format!("  sudo ln -sf {} {}", src_path, symlink_path.display()));
+        false
+    }
+}
+
 /// Map a missing shared-library name to the package that provides it,
 /// per package manager.  Returns (apt, dnf, pacman) package names.
 #[cfg(target_os = "linux")]
@@ -618,6 +704,7 @@ fn linux_check_deps(binary: &PathBuf) -> bool {
     let mut missing_apt:    Vec<String> = Vec::new();
     let mut missing_dnf:    Vec<String> = Vec::new();
     let mut missing_pacman: Vec<String> = Vec::new();
+    let mut missing_sonames: Vec<String> = Vec::new(); // raw SONAME strings for symlink fallback
 
     for line in text.lines() {
         if !line.contains("not found") { continue; }
@@ -625,9 +712,12 @@ fn linux_check_deps(binary: &PathBuf) -> bool {
         let lib = line.split_whitespace().next().unwrap_or("").trim();
         let (apt, dnf, pac) = missing_lib_to_packages(lib);
         let apt_known = !apt.is_empty();
-        if apt_known              && !missing_apt.contains(&apt)    { missing_apt.push(apt); }
-        if !dnf.is_empty()        && !missing_dnf.contains(&dnf)    { missing_dnf.push(dnf); }
-        if !pac.is_empty()        && !missing_pacman.contains(&pac) { missing_pacman.push(pac); }
+        if apt_known              && !missing_apt.contains(&apt)          { missing_apt.push(apt); }
+        if !dnf.is_empty()        && !missing_dnf.contains(&dnf)          { missing_dnf.push(dnf); }
+        if !pac.is_empty()        && !missing_pacman.contains(&pac)       { missing_pacman.push(pac); }
+        if !lib.is_empty()        && !missing_sonames.contains(&lib.to_string()) {
+            missing_sonames.push(lib.to_string());
+        }
 
         if !apt_known {
             // Unknown lib — print the raw name so the user knows what's missing
@@ -650,11 +740,24 @@ fn linux_check_deps(binary: &PathBuf) -> bool {
             .args(["apt-get", "install", "-y"])
             .args(&pkgs)
             .status().map(|s| s.success()).unwrap_or(false);
-        if success { ok("Dependencies installed."); true }
-        else {
-            warn("Auto-install failed. Run manually:");
-            info(&format!("  sudo apt-get install -y {}", pkgs.join(" ")));
-            false
+        if success {
+            ok("Dependencies installed.");
+            true
+        } else {
+            // apt-get failed — the package might not exist in this distro's repos
+            // (e.g. libvpx7 on Ubuntu 24.04 which has libvpx9 instead).
+            // Try creating compat symlinks for any soname version mismatches.
+            let symlinked = missing_sonames.iter()
+                .filter(|s| s.contains(".so."))
+                .all(|s| try_soname_compat_symlink(s));
+            if symlinked {
+                ok("Resolved via compat symlinks.");
+                true
+            } else {
+                warn("Auto-install failed. Run manually:");
+                info(&format!("  sudo apt-get install -y {}", pkgs.join(" ")));
+                false
+            }
         }
     } else if find_bin("dnf").is_some() {
         let pkgs: Vec<&str> = missing_dnf.iter().map(|s| s.as_str()).collect();
@@ -704,7 +807,7 @@ fn scan_log_for_crash_reason(start_offset: u64) -> Option<String> {
             .map(|s| s.trim())
             .unwrap_or("unknown library");
         return Some(format!(
-            "Missing system library: {}\n  Fix:  sudo apt-get install xdotool libasound2 libv4l2-0 libxtst6 libvpx7 libopus0 libjack-jackd2-0",
+            "Missing system library: {}\n  Fix:  andromeda doctor  (auto-installs or creates compat symlinks)",
             lib
         ));
     }
@@ -871,7 +974,28 @@ fn spawn_bg(binary: &PathBuf, api_key: &str, port: u16, sudo: bool, audio_backen
 
 // ─── Download utilities ───────────────────────────────────────────────────────
 
-fn dashboard_asset_name() -> String {
+/// Returns the Ubuntu major version (e.g. 24 for Ubuntu 24.04), or None if
+/// not running Ubuntu or the version cannot be detected.
+#[cfg(target_os = "linux")]
+fn ubuntu_major_version() -> Option<u32> {
+    let text = std::fs::read_to_string("/etc/os-release").ok()?;
+    let is_ubuntu = text.lines().any(|l| {
+        let l = l.to_lowercase();
+        l == "id=ubuntu" || l == "id=\"ubuntu\""
+    });
+    if !is_ubuntu { return None; }
+    for line in text.lines() {
+        if line.starts_with("VERSION_ID=") {
+            let val = line["VERSION_ID=".len()..].trim_matches('"');
+            return val.split('.').next()?.parse().ok();
+        }
+    }
+    None
+}
+
+/// Returns a priority-ordered list of dashboard asset names to try.
+/// The most specific (distro-aware) name comes first; the generic name is the fallback.
+fn dashboard_asset_names() -> Vec<String> {
     let os = match std::env::consts::OS {
         "windows" => "windows",
         "macos"   => "macos",
@@ -883,11 +1007,28 @@ fn dashboard_asset_name() -> String {
         "arm"     => "arm",
         _         => "x86_64",
     };
-    if cfg!(windows) {
-        format!("andromeda-dashboard-{}-{}.exe", os, arch)
-    } else {
-        format!("andromeda-dashboard-{}-{}", os, arch)
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    let generic = format!("andromeda-dashboard-{}-{}{}", os, arch, ext);
+
+    // On Linux, try a distro-specific build first (e.g. ubuntu24 for Ubuntu 24+).
+    // This avoids libvpx / libc SONAME mismatches between distro generations.
+    #[cfg(target_os = "linux")]
+    {
+        let suffix: Option<&str> = match ubuntu_major_version() {
+            Some(v) if v >= 24 => Some("ubuntu24"),
+            _                  => None,
+        };
+        if let Some(s) = suffix {
+            let specific = format!("andromeda-dashboard-{}-{}-{}{}", os, arch, s, ext);
+            return vec![specific, generic];
+        }
     }
+
+    vec![generic]
+}
+
+fn dashboard_asset_name() -> String {
+    dashboard_asset_names().into_iter().next().unwrap_or_default()
 }
 
 /// Asset name for the CLI binary itself (used by self-update).
@@ -924,8 +1065,8 @@ async fn cmd_self_update() -> Result<()> {
     print!("  Checking latest release...  ");
     std::io::stdout().flush().ok();
 
-    let (latest_tag, download_url) =
-        github_latest_asset(cli_repo, &asset_name).await
+    let (latest_tag, download_url, _) =
+        github_latest_asset(cli_repo, &[asset_name]).await
             .context("Could not fetch latest CLI release from GitHub")?;
 
     // Clear the "Checking..." line
@@ -1021,7 +1162,9 @@ async fn cmd_self_update() -> Result<()> {
     Ok(())
 }
 
-async fn github_latest_asset(repo: &str, asset_name: &str) -> Result<(String, String)> {
+/// Find the first matching asset (tried in order) in the latest GitHub release.
+/// Returns (tag, download_url, matched_asset_name).
+async fn github_latest_asset(repo: &str, asset_names: &[String]) -> Result<(String, String, String)> {
     let api_url = format!("https://api.github.com/repos/{}/releases/latest", repo);
     let resp: serde_json::Value = reqwest::Client::builder()
         .user_agent("andromeda-cli")
@@ -1031,18 +1174,21 @@ async fn github_latest_asset(repo: &str, asset_name: &str) -> Result<(String, St
         .json().await.context("parse GitHub API response")?;
 
     let tag = resp["tag_name"].as_str().unwrap_or("?").to_string();
-    for asset in resp["assets"].as_array().context("no assets in release")? {
-        if asset["name"].as_str() == Some(asset_name) {
-            if let Some(url) = asset["browser_download_url"].as_str() {
-                return Ok((tag, url.to_string()));
+    let assets = resp["assets"].as_array().context("no assets in release")?;
+
+    for name in asset_names {
+        for asset in assets.iter() {
+            if asset["name"].as_str() == Some(name.as_str()) {
+                if let Some(url) = asset["browser_download_url"].as_str() {
+                    return Ok((tag, url.to_string(), name.clone()));
+                }
             }
         }
     }
-    bail!("Asset '{}' not found in release {}.\nAvailable: {}",
-        asset_name, tag,
-        resp["assets"].as_array().map(|a| {
-            a.iter().filter_map(|x| x["name"].as_str()).collect::<Vec<_>>().join(", ")
-        }).unwrap_or_default()
+
+    bail!("None of {:?} found in release {}.\nAvailable: {}",
+        asset_names, tag,
+        assets.iter().filter_map(|x| x["name"].as_str()).collect::<Vec<_>>().join(", ")
     )
 }
 
@@ -1212,12 +1358,12 @@ async fn cmd_version(repo: &str) {
 async fn cmd_install(repo: &str) -> Result<()> {
     cyan_box("ANDROMEDA — INSTALL DASHBOARD");
 
-    let asset = dashboard_asset_name();
+    let asset_names = dashboard_asset_names();
     hdr("RELEASE INFO");
     info(&format!("Repository : {}", repo));
-    info(&format!("Asset      : {}", asset));
 
-    let (tag, url) = github_latest_asset(repo, &asset).await?;
+    let (tag, url, chosen_asset) = github_latest_asset(repo, &asset_names).await?;
+    info(&format!("Asset      : {}", chosen_asset));
     ok(&format!("Release    : {}", tag));
 
     let dest = default_binary_path();
@@ -1289,10 +1435,10 @@ async fn cmd_install(repo: &str) -> Result<()> {
 async fn cmd_update(repo: &str) -> Result<()> {
     cyan_box("ANDROMEDA — UPDATE DASHBOARD");
 
-    let cfg   = load_config();
-    let asset = dashboard_asset_name();
+    let cfg         = load_config();
+    let asset_names = dashboard_asset_names();
 
-    let (latest_tag, url) = github_latest_asset(repo, &asset).await?;
+    let (latest_tag, url, _chosen) = github_latest_asset(repo, &asset_names).await?;
     let installed = cfg.installed_version.as_deref().unwrap_or("unknown");
 
     info(&format!("Installed  : {}", installed));
