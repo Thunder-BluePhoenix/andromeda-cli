@@ -1066,7 +1066,7 @@ async fn cmd_self_update() -> Result<()> {
     std::io::stdout().flush().ok();
 
     let (latest_tag, download_url, _) =
-        github_latest_asset(cli_repo, &[asset_name]).await
+        github_latest_asset(cli_repo, &[asset_name.clone()]).await
             .context("Could not fetch latest CLI release from GitHub")?;
 
     // Clear the "Checking..." line
