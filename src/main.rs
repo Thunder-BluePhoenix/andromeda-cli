@@ -661,10 +661,18 @@ fn missing_lib_to_packages(lib: &str) -> (String, String, String) {
         (s("libxtst6"), s("libXtst"), s("libxtst"))
     } else if lib.contains("Xfixes") {
         (s("libxfixes3"), s("libXfixes"), s("libxfixes"))
+    } else if lib.contains("Xinerama") {
+        (s("libxinerama1"), s("libXinerama"), s("libxinerama"))
     } else if lib.contains("Xext") {
         (s("libxext6"), s("libXext"), s("libxext"))
+    } else if lib.contains("Xau") {
+        (s("libxau6"), s("libXau"), s("libxau"))
+    } else if lib.contains("Xdmcp") {
+        (s("libxdmcp6"), s("libXdmcp"), s("libxdmcp"))
     } else if lib.contains("X11") {
         (s("libx11-6"), s("libX11"), s("libx11"))
+    } else if lib.contains("xkbcommon") {
+        (s("libxkbcommon0"), s("libxkbcommon"), s("libxkbcommon"))
     } else if lib.contains("xcb") {
         (s("libxcb1"), s("libxcb"), s("libxcb"))
     } else if lib.contains("vpx") {
@@ -681,6 +689,13 @@ fn missing_lib_to_packages(lib: &str) -> (String, String, String) {
         (s("libopus0"), s("opus"), s("opus"))
     } else if lib.contains("jack") {
         (s("libjack-jackd2-0"), s("jack-audio-connection-kit-libs"), s("jack2"))
+    } else if lib.contains("ssl") || lib.contains("crypto") {
+        // openssl runtime — libssl.so.3 and libcrypto.so.3 both come from libssl3
+        (s("libssl3"), s("openssl-libs"), s("openssl"))
+    } else if lib.contains("bsd") {
+        (s("libbsd0"), s("libbsd"), s("libbsd"))
+    } else if lib.contains("libmd") {
+        (s("libmd0"), s("libmd"), s("libmd"))
     } else {
         (s(""), s(""), s(""))
     }
@@ -1422,6 +1437,14 @@ async fn cmd_install(repo: &str) -> Result<()> {
         cfg.api_key = Some(k);
     }
     save_config(&cfg)?;
+
+    // On Linux: check and auto-install any missing runtime libraries immediately
+    // after download so the user gets feedback before they try to start.
+    #[cfg(target_os = "linux")]
+    {
+        hdr("CHECKING RUNTIME DEPENDENCIES");
+        linux_check_deps(&dest);
+    }
 
     green_box("ANDROMEDA DASHBOARD INSTALLED");
     println!();
@@ -2917,30 +2940,38 @@ async fn cmd_setup(repo: &str) -> Result<()> {
         let pw_ok = pipewire_installed();
         let pw_tag = if pw_ok { " [installed]" } else { " [not installed — can install now]" };
 
-        println!("  1) cap        — Safest. Cap RLIMIT_NOFILE to 1024 so ALSA never");
-        println!("                  gets a high FD. Up to ~1009 concurrent connections.");
-        println!("                  Recommended for most desktop/laptop setups.  [default]");
+        // On Ubuntu 22.04+ (which ships PipeWire by default), subprocess mode is
+        // the most reliable: no FD limit, no extra packages, works out of the box.
+        let ubuntu_version = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+        let is_ubuntu_modern = ubuntu_version.contains("Ubuntu")
+            && (ubuntu_version.contains("22.04") || ubuntu_version.contains("24.04")
+                || ubuntu_version.contains("23.") || ubuntu_version.contains("25."));
+        let default_mode = if is_ubuntu_modern { "2" } else { "1" };
+        let cap_tag        = if default_mode == "1" { "  [default]" } else { "" };
+        let subprocess_tag = if default_mode == "2" { "  [default — recommended for Ubuntu 22.04+]" } else { "" };
+
+        println!("  1) cap        — Cap RLIMIT_NOFILE to 1024 so ALSA never gets a high FD.");
+        println!("                  Up to ~1009 concurrent connections.{}", cap_tag);
         println!();
         println!("  2) subprocess — Audio captured in an isolated child process.");
-        println!("                  Main dashboard has unlimited FDs and can't crash.");
-        println!("                  No extra packages needed.");
+        println!("                  No FD limit. No extra packages needed.{}", subprocess_tag);
         println!();
         println!("  3) pipewire   — Route ALSA through the PipeWire bridge.{}", pw_tag);
-        println!("                  PipeWire uses epoll, not select() — no FD_SETSIZE limit.");
-        println!("                  Unlimited connections, full audio quality.");
+        println!("                  PipeWire uses epoll — no FD_SETSIZE limit.");
         println!();
-        println!("  4) guard      — Soft check per audio/camera call. Skips audio when");
-        println!("                  FDs are high. No connection limit but may skip audio.");
+        println!("  4) guard      — Soft check per call. Skips audio when FDs are high.");
         println!();
         println!("  5) off        — Disable audio and camera entirely.");
         println!("                  Best for headless servers with no microphone/webcam.");
         println!();
-        print!("  Choice [1]: ");
+        print!("  Choice [{}]: ", default_mode);
         std::io::stdout().flush()?;
         let mut ans = String::new();
         std::io::stdin().read_line(&mut ans)?;
+        let choice = if ans.trim().is_empty() { default_mode } else { ans.trim() };
 
-        let audio_mode: &str = match ans.trim() {
+        let audio_mode: &str = match choice {
+            "1" => "cap",
             "2" => "subprocess",
             "3" => {
                 // PipeWire: install packages if not present.
@@ -2951,7 +2982,7 @@ async fn cmd_setup(repo: &str) -> Result<()> {
             }
             "4" => "guard",
             "5" => "off",
-            _   => "cap",
+            _   => if is_ubuntu_modern { "subprocess" } else { "cap" },
         };
         cfg.audio_backend = Some(audio_mode.to_string());
         save_config(&cfg)?;
